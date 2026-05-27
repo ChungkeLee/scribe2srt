@@ -8,7 +8,7 @@ import sys
 import os
 import json
 import ctypes
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -57,7 +57,13 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self._apply_dark_mode_title_bar()
 
-        self.selected_file_path = None
+        self.selected_file_paths: List[str] = []
+        self.current_processing_file: Optional[str] = None
+        self.batch_queue: List[str] = []
+        self.batch_results: List[Dict[str, Any]] = []
+        self.current_batch_index: int = -1
+        self.batch_mode: bool = False
+        self.batch_cancelled: bool = False
         self.thread = None
         self.worker = None
         self.temp_audio_file = None
@@ -150,7 +156,7 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self):
         """连接所有UI控件的信号到槽函数。"""
-        self.select_button.clicked.connect(self.select_file)
+        self.select_button.clicked.connect(self.select_files)
         self.start_button.clicked.connect(self.start_process)
         self.cancel_button.clicked.connect(self.cancel_process)
         self.async_settings_button.clicked.connect(self.open_async_settings_dialog)
@@ -258,36 +264,47 @@ class MainWindow(QMainWindow):
             self.log_area.append("并发处理设置已更新。")
 
     # --- 文件处理与UI状态 ---
-    def set_file(self, file_path: Optional[str]):
+    def set_files(self, file_paths: Optional[List[str]]):
         """设置当前要处理的文件并更新UI。"""
-        if file_path and os.path.exists(file_path):
-            self.selected_file_path = file_path
-            file_name = os.path.basename(file_path)
-            self.file_drop_label.setText(f"已选择:\n{file_name}")
+        self.selected_file_paths = []
+        self.current_processing_file = None
+
+        if file_paths:
+            valid_paths = [path for path in file_paths if path and os.path.exists(path)]
+            self.selected_file_paths = valid_paths
+
+        if self.selected_file_paths:
+            if len(self.selected_file_paths) == 1:
+                file_name = os.path.basename(self.selected_file_paths[0])
+                self.file_drop_label.setText(f"已选择:\n{file_name}")
+            else:
+                first_name = os.path.basename(self.selected_file_paths[0])
+                self.file_drop_label.setText(
+                    f"已选择 {len(self.selected_file_paths)} 个文件\n首个: {first_name}"
+                )
             self.file_drop_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.start_button.setEnabled(True)
             self.log_area.clear()
         else:
-            self.selected_file_path = None
             self.file_drop_label.setText("将音视频或JSON文件拖拽到此处\n\n或")
             self.file_drop_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.start_button.setEnabled(False)
 
-    def select_file(self):
+    def select_files(self):
         """打开文件选择对话框。"""
         dialog_title = "选择文件"
         dialog_filter = (
             "支持的文件 (*.mp3 *.wav *.flac *.m4a *.aac *.mp4 *.mov *.mkv *.json);;"
             "所有文件 (*)"
         )
-        file_path, _ = QFileDialog.getOpenFileName(self, dialog_title, "", dialog_filter)
-        self.set_file(file_path)
+        file_paths, _ = QFileDialog.getOpenFileNames(self, dialog_title, "", dialog_filter)
+        self.set_files(file_paths)
 
     def set_ui_enabled(self, enabled: bool):
         """启用或禁用UI控件以防止在处理期间进行交互。"""
         self.start_button.setVisible(enabled)
         self.cancel_button.setVisible(not enabled)
-        self.start_button.setEnabled(enabled and self.selected_file_path is not None)
+        self.start_button.setEnabled(enabled and bool(self.selected_file_paths))
         self.select_button.setEnabled(enabled)
         self.lang_combo.setEnabled(enabled)
         self.audio_events_checkbox.setEnabled(enabled)
@@ -300,71 +317,151 @@ class MainWindow(QMainWindow):
         self.set_ui_enabled(True)
         self.segmented_progress_bar.setVisible(False)
         self.progress_label.setVisible(False)
-        self.set_file(None)
+        self.set_files([])
 
     # --- 核心处理流程 ---
     def start_process(self):
         """开始处理选定的文件。"""
-        if not self.selected_file_path:
-            QMessageBox.warning(self, "警告", "请先选择一个文件！")
+        if not self.selected_file_paths:
+            QMessageBox.warning(self, "警告", "请先选择至少一个文件！")
             return
 
-        _, ext = os.path.splitext(self.selected_file_path)
-        if ext.lower() == '.json':
-            self._process_json_file_directly(self.selected_file_path)
-            return
+        self.batch_queue = list(self.selected_file_paths)
+        self.batch_mode = len(self.batch_queue) > 1
+        self.batch_cancelled = False
+        self.batch_results = []
+        self.current_batch_index = -1
+        self.current_processing_file = None
+        self.temp_audio_file = None
+        self.upload_complete_logged = False
+
+        if self.batch_mode:
+            self.log_area.append("=" * 50)
+            self.log_area.append(f"开始批量处理，共 {len(self.batch_queue)} 个文件。")
 
         self.set_ui_enabled(False)
+        self._process_next_batch_file()
+
+    def _process_next_batch_file(self):
+        """处理待处理队列中的下一个文件。"""
+        self.current_batch_index += 1
+
+        if self.current_batch_index >= len(self.batch_queue):
+            self._finish_batch_processing()
+            return
+
+        file_path = self.batch_queue[self.current_batch_index]
+        self.current_processing_file = file_path
+        display_name = os.path.basename(file_path)
+
+        if self.batch_mode:
+            self.log_area.append("=" * 50)
+            self.log_area.append(
+                f"正在处理第 {self.current_batch_index + 1}/{len(self.batch_queue)} 个文件: {display_name}"
+            )
+            self.file_drop_label.setText(
+                f"批量处理中 ({self.current_batch_index + 1}/{len(self.batch_queue)}):\n{display_name}"
+            )
+        else:
+            self.log_area.clear()
+            self.log_area.append("=" * 50)
+            self.log_area.append(f"开始处理文件: {display_name}")
+            self.file_drop_label.setText(f"已选择:\n{display_name}")
+
+        self.file_drop_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # 重置进度显示
+        self.segmented_progress_bar.reset()
+        self.segmented_progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.progress_label.setText("")
+        self.upload_complete_logged = False
+        self.temp_audio_file = None
+
+        _, ext = os.path.splitext(file_path)
+        if ext.lower() == '.json':
+            self._process_json_file_directly(file_path, from_batch=self.batch_mode)
+        else:
+            self._begin_media_processing(file_path)
+
+    def _begin_media_processing(self, source_file: str):
+        """准备并启动音视频文件的处理流程。"""
         self.segmented_progress_bar.setVisible(True)
-        self.segmented_progress_bar.set_single_file_mode(self.selected_file_path)
+        self.segmented_progress_bar.set_single_file_mode(source_file)
         self.progress_label.setText("准备中...")
         self.progress_label.setVisible(True)
 
-        file_to_process = self.selected_file_path
+        file_to_process = source_file
+        _, ext = os.path.splitext(source_file)
 
         video_extensions = ['.mp4', '.mkv', '.mov', '.avi', '.flv', '.webm']
         if ext.lower() in video_extensions:
             if self.ffmpeg_available:
                 self.log_area.append("检测到视频文件，正在分析音频流...")
 
-                media_info = get_media_info(self.selected_file_path, self.log_area.append)
+                media_info = get_media_info(source_file, self.log_area.append)
                 codec = media_info.get("codec") if media_info else None
 
                 if not codec:
-                    self.on_task_error("无法检测到视频中的音频编码，无法继续提取。")
+                    error_msg = "无法检测到视频中的音频编码，无法继续提取。"
+                    if self.batch_mode:
+                        self.log_area.append(f"\n❌ {error_msg}")
+                        self._record_batch_result("error", error_msg)
+                        self._finalize_current_batch_step()
+                    else:
+                        self.on_task_error(error_msg)
+                        self.set_ui_enabled(True)
+                        self.segmented_progress_bar.setVisible(False)
+                        self.progress_label.setVisible(False)
+                        self.progress_label.setText("")
                     return
 
                 extension = CODEC_EXTENSION_MAP.get(codec, DEFAULT_AUDIO_EXTENSION)
                 self.log_area.append(f"检测到音频编码: {codec}。将使用 '{extension}' 容器进行提取。")
 
-                base_name, _ = os.path.splitext(os.path.basename(self.selected_file_path))
-                temp_audio_path = os.path.join(os.path.dirname(self.selected_file_path), f"temp_audio_{base_name}{extension}")
+                base_name, _ = os.path.splitext(os.path.basename(source_file))
+                temp_audio_path = os.path.join(os.path.dirname(source_file), f"temp_audio_{base_name}{extension}")
 
                 self.log_area.append("正在提取音频...")
-                if not extract_audio(self.selected_file_path, temp_audio_path, self.log_area.append):
-                    self.on_task_error("音频提取失败。")
+                if not extract_audio(source_file, temp_audio_path, self.log_area.append):
+                    error_msg = "音频提取失败。"
+                    if self.batch_mode:
+                        self.log_area.append(f"\n❌ {error_msg}")
+                        self._record_batch_result("error", error_msg)
+                        self._finalize_current_batch_step()
+                    else:
+                        self.on_task_error(error_msg)
+                        self.set_ui_enabled(True)
+                        self.segmented_progress_bar.setVisible(False)
+                        self.progress_label.setVisible(False)
+                        self.progress_label.setText("")
                     return
 
                 self.temp_audio_file = temp_audio_path
                 file_to_process = temp_audio_path
             else:
-                QMessageBox.warning(self, "功能限制", "检测到视频文件但未找到 FFmpeg。\n将尝试直接上传原始文件，但这可能失败。")
-                self.log_area.append("警告: 正在尝试直接上传视频文件...")
+                warning_msg = "检测到视频文件但未找到 FFmpeg。\n将尝试直接上传原始文件，但这可能失败。"
+                if not self.batch_mode:
+                    QMessageBox.warning(self, "功能限制", warning_msg)
+                self.log_area.append("⚠️ 未找到 FFmpeg，尝试直接上传视频文件。")
 
-        self._execute_transcription_task(file_to_process, self.selected_file_path)
+        self._execute_transcription_task(file_to_process, source_file)
 
-    def _process_json_file_directly(self, json_path: str):
+    def _process_json_file_directly(self, json_path: str, from_batch: bool = False):
         """直接从JSON文件生成SRT，不进行API调用。"""
         self.set_ui_enabled(False)
-        self.log_area.clear()
-        self.log_area.append("="*50)
-        self.log_area.append(f"检测到JSON文件，直接生成SRT...")
+        if not from_batch:
+            self.log_area.clear()
+        self.log_area.append("=" * 50)
+        self.log_area.append("检测到JSON文件，直接生成SRT...")
+
+        success = False
+        message = ""
 
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 json_data = json.load(f)
 
-            # 移除pause_threshold参数，使用新的算法
             srt_data = create_srt_from_json(
                 json_data,
                 max_subtitle_duration=self.max_subtitle_duration,
@@ -377,12 +474,102 @@ class MainWindow(QMainWindow):
             with open(output_srt_path, 'w', encoding='utf-8') as f:
                 f.write(srt_data)
 
-            self.log_area.append(f"SRT字幕文件已保存到:\n{output_srt_path}")
-            QMessageBox.information(self, "成功", "JSON文件处理成功！")
-        except (Exception) as e:
-            self.on_task_error(f"处理JSON文件时出错: {e}")
+            message = f"SRT字幕文件已保存到:\n{output_srt_path}"
+            self.log_area.append(message)
+            if not from_batch:
+                QMessageBox.information(self, "成功", "JSON文件处理成功！")
+            success = True
+        except Exception as e:
+            message = f"处理JSON文件时出错: {e}"
+            if from_batch:
+                self.log_area.append(f"\n❌ {message}")
+            else:
+                self.on_task_error(message)
         finally:
+            if from_batch:
+                status = "success" if success else "error"
+                self._record_batch_result(status, message)
+                self._finalize_current_batch_step()
+            else:
+                self.reset_ui_after_task()
+
+    def _record_batch_result(self, status: str, message: str):
+        """记录当前文件的批量处理结果。"""
+        if not self.batch_mode or not self.current_processing_file:
+            return
+
+        self.batch_results.append({
+            "file": self.current_processing_file,
+            "status": status,
+            "message": message
+        })
+
+    def _finalize_current_batch_step(self):
+        """在当前文件处理完成后调度下一步。"""
+        if not self.batch_mode:
             self.reset_ui_after_task()
+            return
+
+        if self.batch_cancelled:
+            self._finish_batch_processing()
+            return
+
+        if self.current_batch_index < len(self.batch_queue) - 1:
+            QTimer.singleShot(400, self._process_next_batch_file)
+        else:
+            self._finish_batch_processing()
+
+    def _finish_batch_processing(self):
+        """结束批量处理并输出总结。"""
+        if not self.batch_mode:
+            return
+
+        total = len(self.batch_queue)
+        success_items = [item for item in self.batch_results if item.get("status") == "success"]
+        error_items = [item for item in self.batch_results if item.get("status") == "error"]
+        cancelled_items = [item for item in self.batch_results if item.get("status") == "cancelled"]
+        remaining = max(0, total - (self.current_batch_index + 1))
+
+        summary_parts = []
+        if success_items:
+            summary_parts.append(f"成功 {len(success_items)}")
+        if error_items:
+            summary_parts.append(f"失败 {len(error_items)}")
+        if cancelled_items:
+            summary_parts.append(f"取消 {len(cancelled_items)}")
+        if remaining:
+            summary_parts.append(f"未处理 {remaining}")
+
+        summary_text = "，".join(summary_parts) if summary_parts else "无任务执行"
+
+        self.log_area.append("\n" + "=" * 50)
+        self.log_area.append(f"批量处理完成（共 {total} 个文件）：{summary_text}")
+
+        if error_items:
+            self.log_area.append("失败列表：")
+            for item in error_items:
+                self.log_area.append(f" - {os.path.basename(item['file'])}: {item['message']}")
+
+        if cancelled_items:
+            self.log_area.append("已取消：")
+            for item in cancelled_items:
+                self.log_area.append(f" - {os.path.basename(item['file'])}: {item['message']}")
+
+        if remaining:
+            self.log_area.append(f"尚有 {remaining} 个文件未处理。")
+
+        title = "批量处理完成" if not self.batch_cancelled else "批量处理已取消"
+        QMessageBox.information(self, title, f"批量处理完成，共 {total} 个文件。\n{summary_text}")
+
+        # 重置批量状态
+        self.batch_mode = False
+        self.batch_queue = []
+        self.batch_results = []
+        self.batch_cancelled = False
+        self.current_batch_index = -1
+        self.current_processing_file = None
+
+        self.reset_ui_after_task()
 
     def _execute_transcription_task(self, file_to_process, original_file, restore_state=None):
         """创建并启动后台Worker线程来执行转录任务。"""
@@ -438,6 +625,10 @@ class MainWindow(QMainWindow):
         self.log_area.append("\n正在请求取消任务...")
         self._pending_retry_state = None # 取消时清除重试状态
 
+        if self.batch_mode:
+            self.batch_cancelled = True
+            self.log_area.append("批量模式：后续文件将被跳过。")
+
         # 取消时清理临时文件
         self._cleanup_temp_audio_file()
 
@@ -447,8 +638,17 @@ class MainWindow(QMainWindow):
     # --- 信号槽函数 ---
     def on_task_finished(self, message: str):
         """任务成功完成时的处理。"""
-        QMessageBox.information(self, "成功", message)
-        self.log_area.append(f"\n✅ {message}")
+        display_name = os.path.basename(self.current_processing_file) if self.current_processing_file else ""
+
+        if self.batch_mode:
+            if display_name:
+                self.log_area.append(f"\n✅ {display_name}: {message}")
+            else:
+                self.log_area.append(f"\n✅ {message}")
+            self._record_batch_result("success", message)
+        else:
+            QMessageBox.information(self, "成功", message)
+            self.log_area.append(f"\n✅ {message}")
 
         # 任务成功完成，清理临时文件并清除重试状态
         self._pending_retry_state = None
@@ -459,27 +659,43 @@ class MainWindow(QMainWindow):
 
     def on_task_error(self, message: str):
         """任务失败时的处理，提供重试选项。"""
-        self.log_area.append(f"\n❌ 任务失败: {message}")
+        display_name = os.path.basename(self.current_processing_file) if self.current_processing_file else ""
+        is_cancelled = "用户取消" in message or "cancelled" in message.lower()
 
-        if "用户取消" in message or "cancelled" in message.lower():
-            self._pending_retry_state = None
-        else:
-            msg_box = QMessageBox(self)
-            msg_box.setIcon(QMessageBox.Icon.Critical)
-            msg_box.setWindowTitle("错误")
-            msg_box.setText("任务执行失败。")
-            msg_box.setInformativeText(message)
-            retry_button = msg_box.addButton("重试", QMessageBox.ButtonRole.AcceptRole)
-            msg_box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
-
-            msg_box.exec()
-
-            if msg_box.clickedButton() == retry_button:
-                # 保存状态以供重试
-                if self.worker:
-                    self._pending_retry_state = self.worker.get_state()
+        if self.batch_mode:
+            status = "cancelled" if is_cancelled else "error"
+            if display_name:
+                self.log_area.append(f"\n❌ {display_name}: {message}")
             else:
+                self.log_area.append(f"\n❌ 任务失败: {message}")
+            if status == "cancelled":
+                self.batch_cancelled = True
+            self._pending_retry_state = None
+            self._record_batch_result(status, message)
+            # 批量模式下不保留临时文件
+            self._cleanup_temp_audio_file()
+        else:
+            self.log_area.append(f"\n❌ 任务失败: {message}")
+
+            if is_cancelled:
                 self._pending_retry_state = None
+            else:
+                msg_box = QMessageBox(self)
+                msg_box.setIcon(QMessageBox.Icon.Critical)
+                msg_box.setWindowTitle("错误")
+                msg_box.setText("任务执行失败。")
+                msg_box.setInformativeText(message)
+                retry_button = msg_box.addButton("重试", QMessageBox.ButtonRole.AcceptRole)
+                msg_box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+
+                msg_box.exec()
+
+                if msg_box.clickedButton() == retry_button:
+                    # 保存状态以供重试
+                    if self.worker:
+                        self._pending_retry_state = self.worker.get_state()
+                else:
+                    self._pending_retry_state = None
 
         if self.thread:
             self.thread.quit()
@@ -535,8 +751,16 @@ class MainWindow(QMainWindow):
         if self._pending_retry_state:
             QTimer.singleShot(1000, self._execute_retry)
         else:
-            # 只有在没有重试时才重置UI状态
-            self.reset_ui_after_task()
+            if self.batch_mode:
+                self._finalize_current_batch_step()
+            else:
+                self.reset_ui_after_task()
+
+        # 清理线程对象
+        if self.thread and not self.thread.isRunning():
+            self.thread.deleteLater()
+            self.thread = None
+        self.worker = None
 
     def _execute_retry(self):
         """执行重试逻辑。"""
@@ -615,6 +839,14 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event):
         """处理文件拖放事件。"""
         urls = event.mimeData().urls()
-        if urls:
-            file_path = urls[0].toLocalFile()
-            self.set_file(file_path)
+        if not urls:
+            return
+
+        file_paths: List[str] = []
+        for url in urls:
+            local_path = url.toLocalFile()
+            if local_path and os.path.isfile(local_path):
+                file_paths.append(local_path)
+
+        if file_paths:
+            self.set_files(file_paths)
