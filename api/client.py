@@ -15,7 +15,7 @@ from core.ffmpeg_utils import get_media_info
 
 ELEVENLABS_STT_API_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 ELEVENLABS_STT_PARAMS = {"allow_unauthenticated": "1"}
-DEFAULT_STT_MODEL_ID = "scribe_v1"
+DEFAULT_STT_MODEL_ID = "scribe_v2"
 # --- Header Configuration ---
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
