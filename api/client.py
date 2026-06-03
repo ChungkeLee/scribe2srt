@@ -30,6 +30,10 @@ ACCEPT_LANGUAGES = [
     "ja-JP,ja;q=0.9,en;q=0.8", "ko-KR,ko;q=0.9,en;q=0.8", "de-DE,de;q=0.9,en;q=0.8",
     "fr-FR,fr;q=0.9,en;q=0.8", "en-US,en;q=0.5",
 ]
+
+def _random_ip() -> str:
+    return f"{random.randint(1, 223)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(1, 254)}"
+
 BASE_HEADERS = {
     "accept": "*/*",
     "accept-encoding": "gzip, deflate, br, zstd",
@@ -157,5 +161,8 @@ class ElevenLabsSTTClient:
         headers = BASE_HEADERS.copy()
         headers["user-agent"] = random.choice(USER_AGENTS)
         headers["accept-language"] = random.choice(ACCEPT_LANGUAGES)
+        headers["X-Forwarded-For"] = _random_ip()
+        headers["X-Real-IP"] = _random_ip()
+        headers["X-Client-IP"] = _random_ip()
         
         return Uploader(file_path, payload, headers)
