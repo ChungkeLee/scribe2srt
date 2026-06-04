@@ -1,5 +1,6 @@
 import os
 import random
+import ipaddress
 from typing import Optional, Any, Dict
 
 import requests
@@ -32,7 +33,15 @@ ACCEPT_LANGUAGES = [
 ]
 
 def _random_ip() -> str:
-    return f"{random.randint(1, 223)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(1, 254)}"
+    """生成一个真正的、合法的公网 IPv4 地址（严格过滤私有/保留地址）"""
+    while True:
+        ip_int = random.getrandbits(32)
+        ip_obj = ipaddress.IPv4Address(ip_int)
+        if (ip_obj.is_private or ip_obj.is_loopback or
+            ip_obj.is_multicast or ip_obj.is_link_local or
+            ip_obj.is_reserved):
+            continue
+        return str(ip_obj)
 
 BASE_HEADERS = {
     "accept": "*/*",
@@ -157,12 +166,19 @@ class ElevenLabsSTTClient:
         if language_code and language_code.lower() != "auto":
             payload["language_code"] = language_code
 
-        # Assemble headers using the simple and effective final approach
+        # Assemble headers with high-fidelity IP spoofing for bypassing IP restrictions
         headers = BASE_HEADERS.copy()
         headers["user-agent"] = random.choice(USER_AGENTS)
         headers["accept-language"] = random.choice(ACCEPT_LANGUAGES)
-        headers["X-Forwarded-For"] = _random_ip()
-        headers["X-Real-IP"] = _random_ip()
-        headers["X-Client-IP"] = _random_ip()
+
+        fake_ip = _random_ip()
+        forward_headers = {
+            "Forwarded": f"for={fake_ip}",
+            "X-Forwarded-For": fake_ip,
+            "X-Real-IP": fake_ip,
+            "CF-Connecting-IP": fake_ip,
+            "True-Client-IP": fake_ip,
+        }
+        headers.update(forward_headers)
         
         return Uploader(file_path, payload, headers)
