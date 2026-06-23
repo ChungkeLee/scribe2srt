@@ -11,7 +11,10 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from .optimize_based_on_analysis import EnhancedSubtitleAnalyzer
+try:
+    from .optimize_based_on_analysis import EnhancedSubtitleAnalyzer
+except ImportError:
+    from optimize_based_on_analysis import EnhancedSubtitleAnalyzer
 
 def test_single_file(srt_path: str):
     """测试单个SRT文件"""
@@ -52,7 +55,7 @@ def test_single_file(srt_path: str):
     print(f"违规总数: {total_violations}")
     
     if total_violations == 0:
-        print("🎉 恭喜！所有字幕都符合规则要求！")
+        print("所有字幕都符合规则要求！")
         return
     
     print("\n违规详情:")
@@ -62,6 +65,7 @@ def test_single_file(srt_path: str):
     violation_names = {
         'duration_too_short': '时长过短',
         'duration_too_long': '时长过长',
+        'overlap': '时间重叠',
         'gap_too_small': '间隔过小',
         'cps_too_high': 'CPS过高',
         'cpl_exceeded': '行长超限',
@@ -81,6 +85,8 @@ def test_single_file(srt_path: str):
                 elif violation_type == 'duration_too_long':
                     print(f"  {i}. #{example['number']}: {example['duration']:.1f}s > {rules['max_duration']:.1f}s")
                     print(f"     文本: {example['text']}")
+                elif violation_type == 'overlap':
+                    print(f"  {i}. #{example['number']}-{example['next_number']}: 重叠 {-example['gap']:.3f}s")
                 elif violation_type == 'gap_too_small':
                     print(f"  {i}. #{example['number']}-{example['next_number']}: {example['gap']:.3f}s < {rules['min_gap']:.3f}s")
                 elif violation_type == 'cps_too_high':

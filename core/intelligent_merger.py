@@ -263,8 +263,8 @@ class IntelligentMerger:
         text1 = entry1['text'].strip()
         text2 = entry2['text'].strip()
 
-        # 如果第一个文本以标点符号结尾，直接连接
-        if text1 and text1[-1] in "。？！、，；：""''（）《》「」.?!,;:()\"'-":
+        # 如果第一个文本以标点符号结尾，CJK直接连接；拉丁语言仍需要空格
+        if self.is_cjk and text1 and text1[-1] in "。？！、，；：""''（）《》「」.?!,;:()\"'-":
             merged_text = text1 + text2
         else:
             # 否则添加适当的分隔符

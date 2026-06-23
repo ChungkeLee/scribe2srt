@@ -134,6 +134,7 @@ class EnhancedSubtitleAnalyzer:
         violations = {
             'duration_too_short': [],
             'duration_too_long': [],
+            'overlap': [],
             'gap_too_small': [],
             'cps_too_high': [],
             'cpl_exceeded': [],
@@ -200,7 +201,14 @@ class EnhancedSubtitleAnalyzer:
 
                     # 使用容差来处理浮点数精度问题
                     tolerance = 1e-3  # 1毫秒的容差，更实用的精度
-                    if gap < (self.rules['min_gap'] - tolerance) and gap >= 0:  # 负值表示重叠，单独处理
+                    if gap < 0:
+                        violations['overlap'].append({
+                            'number': subtitle['number'],
+                            'next_number': next_subtitle['number'],
+                            'gap': gap,
+                            'text': subtitle['text'][:30] + '...' if len(subtitle['text']) > 30 else subtitle['text']
+                        })
+                    elif gap < (self.rules['min_gap'] - tolerance):
                         violations['gap_too_small'].append({
                             'number': subtitle['number'],
                             'next_number': next_subtitle['number'],
@@ -279,6 +287,7 @@ class EnhancedSubtitleAnalyzer:
             'violation_types': {
                 'duration_too_short': 0,
                 'duration_too_long': 0,
+                'overlap': 0,
                 'gap_too_small': 0,
                 'cps_too_high': 0,
                 'cpl_exceeded': 0,
@@ -379,6 +388,7 @@ class EnhancedSubtitleAnalyzer:
                 type_name = {
                     'duration_too_short': '时长过短',
                     'duration_too_long': '时长过长',
+                    'overlap': '时间重叠',
                     'gap_too_small': '间隔过小',
                     'cps_too_high': 'CPS过高',
                     'cpl_exceeded': '行长超限',
