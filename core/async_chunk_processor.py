@@ -78,11 +78,13 @@ class ChunkProcessorTask(QRunnable):
                     # 执行上传（同步等待）
                     transcript_json = self._execute_upload_sync(uploader)
 
-                    # 调整时间偏移
+                    # 调整为全局时间轴
                     words = transcript_json.get("words", [])
                     for word in words:
-                        word["start"] = round(word["start"] + self.time_offset, 3)
-                        word["end"] = round(word["end"] + self.time_offset, 3)
+                        if isinstance(word.get("start"), (int, float)):
+                            word["start"] = round(word["start"] + self.time_offset, 3)
+                        if isinstance(word.get("end"), (int, float)):
+                            word["end"] = round(word["end"] + self.time_offset, 3)
 
                     # 保存分段JSON文件
                     self._save_chunk_json(transcript_json)
@@ -177,7 +179,8 @@ class AsyncChunkProcessor(QObject):
                            tag_audio_events: bool,
                            ffmpeg_available: bool,
                            log_callback: Optional[Callable[[str], None]] = None,
-                           chunk_indices: Optional[List[int]] = None) -> bool:
+                           chunk_indices: Optional[List[int]] = None,
+                           chunk_offsets: Optional[Any] = None) -> bool:
         """
         异步处理所有音频片段
 
@@ -189,6 +192,7 @@ class AsyncChunkProcessor(QObject):
             ffmpeg_available: FFmpeg是否可用
             log_callback: 日志回调函数
             chunk_indices: 每个片段对应的全局片段索引。恢复任务时用于保持时间轴偏移正确。
+            chunk_offsets: 每个全局片段的真实起点秒数；缺失时回退到 index * split_duration_sec。
 
         Returns:
             bool: 是否成功启动处理
@@ -214,11 +218,12 @@ class AsyncChunkProcessor(QObject):
         if log_callback:
             log_callback(f"开始异步处理 {self.total_chunks} 个音频片段...")
 
-        # 预计算时间偏移
-        time_offsets = {
-            chunk_index: chunk_index * split_duration_sec
-            for chunk_index in chunk_indices
-        }
+        # 预计算时间偏移。优先使用切片阶段记录的真实起点，保证非等长/静音切割也能对齐。
+        time_offsets = self._build_time_offsets(
+            chunk_indices,
+            split_duration_sec,
+            chunk_offsets
+        )
 
         # 使用Qt的线程池而不是Python的ThreadPoolExecutor
         # 这样可以更好地与Qt信号系统集成
@@ -264,7 +269,23 @@ class AsyncChunkProcessor(QObject):
                 log_callback(f"启动异步处理失败: {e}")
             return False
 
+    def _build_time_offsets(self, chunk_indices: List[int], split_duration_sec: float,
+                            chunk_offsets: Optional[Any] = None) -> Dict[int, float]:
+        resolved_offsets = {}
 
+        for chunk_index in chunk_indices:
+            offset = None
+            if isinstance(chunk_offsets, dict):
+                offset = chunk_offsets.get(chunk_index)
+            elif isinstance(chunk_offsets, list) and 0 <= chunk_index < len(chunk_offsets):
+                offset = chunk_offsets[chunk_index]
+
+            try:
+                resolved_offsets[chunk_index] = round(float(offset), 3)
+            except (TypeError, ValueError):
+                resolved_offsets[chunk_index] = round(chunk_index * split_duration_sec, 3)
+
+        return resolved_offsets
 
     def _wait_for_rate_limit(self):
         """等待速率限制"""

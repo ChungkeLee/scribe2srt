@@ -7,14 +7,18 @@
 import os
 import sys
 import json
+import re
+import shutil
 import subprocess
-from typing import Optional, List, Dict, Any
+import tempfile
+from typing import Optional, List, Dict, Any, Tuple
 
 from PySide6.QtCore import QObject, Signal, QThreadPool
 
 from api.client import ElevenLabsSTTClient
 from .srt_processor import create_srt_from_json
 from .async_chunk_processor import AsyncChunkProcessor
+from .ffmpeg_utils import get_media_info
 
 class Worker(QObject):
     """
@@ -71,6 +75,8 @@ class Worker(QObject):
             self.current_chunk_index = self.restore_state.get("current_chunk_index", 0)
             self.total_chunks = self.restore_state.get("total_chunks", 0)
             self.time_offset = self.restore_state.get("time_offset", 0.0)
+            self.chunk_offsets = self.restore_state.get("chunk_offsets", [])
+            self.temp_chunk_dir = self.restore_state.get("temp_chunk_dir")
             # 恢复处理模式信息
             self.was_single_file_mode = self.restore_state.get("was_single_file_mode", False)
             self.extracted_audio_file = self.restore_state.get("extracted_audio_file", None)
@@ -81,6 +87,8 @@ class Worker(QObject):
             self.current_chunk_index = 0
             self.total_chunks = 0
             self.time_offset = 0.0
+            self.chunk_offsets = []
+            self.temp_chunk_dir = None
             self.was_single_file_mode = False
             self.extracted_audio_file = None
 
@@ -102,6 +110,8 @@ class Worker(QObject):
             "file_path": self.file_path,  # 添加 file_path 到状态中
             "temp_chunks": self.temp_chunks,
             "owned_temp_chunks": self.owned_temp_chunks,
+            "chunk_offsets": self.chunk_offsets,
+            "temp_chunk_dir": self.temp_chunk_dir,
             "combined_transcript": self.combined_transcript,
             "current_chunk_index": restorable_chunk_index,
             "total_chunks": self.total_chunks,
@@ -165,18 +175,21 @@ class Worker(QObject):
                         self.file_path = temp_audio_path
                         self.extracted_audio_file = temp_audio_path
                         self.temp_chunks = [temp_audio_path]
+                        self.chunk_offsets = [0.0]
                         self.log_message.emit(f"音频重新提取完成: {os.path.basename(temp_audio_path)}")
                     else:
                         # 直接使用原始音频文件
                         self.temp_chunks = [original_file]
+                        self.chunk_offsets = [0.0]
                         self.log_message.emit("使用原始音频文件继续处理")
                 else:
                     # 多片段模式：重新切分音频
                     self.log_message.emit("检测到临时切片文件丢失，正在重新切分...")
                     if not self._split_audio(self.restore_state.get("original_file_path", self.original_file_path)):
-                         self.error.emit("恢复任务失败：无法重新切分音频。")
-                         return
+                        self.error.emit("恢复任务失败：无法重新切分音频。")
+                        return
 
+            self._ensure_chunk_offsets()
             # 恢复模式下的处理逻辑
             self._process_restored_chunks()
             return
@@ -197,6 +210,7 @@ class Worker(QObject):
             self.log_message.emit("文件无需切分，执行单文件处理流程。")
             self.total_chunks = 1
             self.temp_chunks.append(self.file_path)
+            self.chunk_offsets = [0.0]
             # 记录单文件模式和提取的音频文件信息
             self.was_single_file_mode = True
             if self.file_path != self.original_file_path:
@@ -205,41 +219,58 @@ class Worker(QObject):
             self._process_next_chunk()
 
     def _split_audio(self, audio_path: str) -> bool:
-        """使用 FFmpeg 切分音频文件。"""
+        """使用 FFmpeg 切分音频文件，并记录每个分片的真实全局起点。"""
         self.log_message.emit("正在切分音频文件...")
         self.chunk_progress.emit(-1, "splitting", "正在切分音频...")
-        
-        base_dir = os.path.dirname(audio_path)
-        base_name, _ = os.path.splitext(os.path.basename(audio_path))
-        
-        output_template = os.path.join(base_dir, f"{base_name}_chunk_%03d.mp3")
-        
-        try:
-            startupinfo = None
-            if sys.platform == "win32":
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-            command = [
-                "ffmpeg", "-i", audio_path,
-                "-f", "segment",
-                "-segment_time", str(self.split_duration_sec),
-                "-c:a", "libmp3lame",
-                "-b:a", "192k",
-                "-y",
-                output_template
-            ]
-            
-            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', startupinfo=startupinfo)
-            
-            self.owned_temp_chunks = sorted([os.path.join(base_dir, f) for f in os.listdir(base_dir) if f.startswith(f"{base_name}_chunk_") and f.endswith(".mp3")])
-            self.temp_chunks = self.owned_temp_chunks
+        base_dir = os.path.dirname(os.path.abspath(audio_path)) or os.getcwd()
+        base_name, _ = os.path.splitext(os.path.basename(audio_path))
+
+        try:
+            self._cleanup_owned_chunk_artifacts()
+
+            media_info = get_media_info(audio_path, lambda message: self.log_message.emit(message))
+            duration = media_info.get("duration") if media_info else None
+            if not duration or duration <= 0:
+                raise RuntimeError("无法获取音频时长，不能安全切分。")
+
+            self.temp_chunk_dir = tempfile.mkdtemp(prefix=f"{base_name}_chunks_", dir=base_dir)
+
+            silence_ranges = self._detect_silence_ranges(audio_path, duration)
+            split_points = self._calculate_smart_split_points(duration, silence_ranges)
+            segment_ranges = self._build_segment_ranges(duration, split_points)
+
+            if silence_ranges:
+                self.log_message.emit(
+                    f"检测到 {len(silence_ranges)} 段静音，优先在静音附近切分。"
+                )
+            else:
+                self.log_message.emit("未检测到可用静音点，将使用固定时间切分。")
+
+            self.owned_temp_chunks = []
+            self.temp_chunks = []
+            self.chunk_offsets = []
+
+            for index, (start, end) in enumerate(segment_ranges):
+                chunk_path = os.path.join(self.temp_chunk_dir, f"{base_name}_chunk_{index:03d}.mp3")
+                self._export_audio_segment(audio_path, chunk_path, start, end)
+                self.owned_temp_chunks.append(chunk_path)
+                self.temp_chunks.append(chunk_path)
+                self.chunk_offsets.append(round(start, 3))
+                self.log_message.emit(
+                    f"片段 {index + 1}: {start:.3f}s -> {end:.3f}s "
+                    f"(时长 {end - start:.3f}s)"
+                )
 
             if not self.owned_temp_chunks:
                 raise RuntimeError("FFmpeg 执行完毕但未找到任何切分文件。")
 
             self.total_chunks = len(self.temp_chunks)
             self.log_message.emit(f"成功切分为 {self.total_chunks} 个片段。")
+            self.log_message.emit(
+                "分片时间偏移: " +
+                ", ".join(f"{offset:.3f}s" for offset in self.chunk_offsets)
+            )
             # 通知UI设置分段进度条
             self.chunks_ready.emit(self.temp_chunks)
             return True
@@ -248,8 +279,223 @@ class Worker(QObject):
             error_message = f"音频切分失败: {e}"
             if hasattr(e, 'stderr'):
                 error_message += f"\nFFmpeg 输出:\n{e.stderr.strip()}"
+            self._cleanup_owned_chunk_artifacts()
             self.error.emit(error_message)
             return False
+
+    def _detect_silence_ranges(self, audio_path: str, duration: float) -> List[Tuple[float, float]]:
+        """Detect silence ranges with FFmpeg silencedetect; returns seconds."""
+        command = [
+            "ffmpeg", "-hide_banner", "-nostdin",
+            "-i", audio_path,
+            "-af", "silencedetect=noise=-40dB:d=0.5",
+            "-f", "null", "-"
+        ]
+
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                startupinfo=self._startupinfo()
+            )
+        except FileNotFoundError:
+            return []
+
+        if result.returncode != 0:
+            self.log_message.emit("静音检测失败，将回退为固定时间切分。")
+            return []
+
+        silence_ranges = []
+        current_start = None
+        start_pattern = re.compile(r"silence_start:\s*([0-9.]+)")
+        end_pattern = re.compile(r"silence_end:\s*([0-9.]+)")
+
+        for line in result.stderr.splitlines():
+            start_match = start_pattern.search(line)
+            if start_match:
+                current_start = float(start_match.group(1))
+                continue
+
+            end_match = end_pattern.search(line)
+            if end_match and current_start is not None:
+                silence_end = float(end_match.group(1))
+                if silence_end > current_start:
+                    silence_ranges.append((current_start, silence_end))
+                current_start = None
+
+        if current_start is not None and duration > current_start:
+            silence_ranges.append((current_start, duration))
+
+        return silence_ranges
+
+    def _calculate_smart_split_points(self, duration: float,
+                                      silence_ranges: List[Tuple[float, float]]) -> List[float]:
+        """Pick split points near silence while preserving practical segment sizes."""
+        split_points = []
+        previous_point = 0.0
+        ideal_point = float(self.split_duration_sec)
+        min_segment_duration = min(
+            max(30.0, self.split_duration_sec * 0.2),
+            max(1.0, self.split_duration_sec * 0.8)
+        )
+        search_window = min(300.0, max(10.0, self.split_duration_sec * 0.15))
+
+        while ideal_point < duration:
+            if duration - ideal_point < min_segment_duration:
+                break
+
+            best_point = None
+            best_distance = float("inf")
+
+            for silence_start, silence_end in silence_ranges:
+                midpoint = (silence_start + silence_end) / 2
+                if midpoint <= previous_point + min_segment_duration:
+                    continue
+                if duration - midpoint < min_segment_duration:
+                    continue
+
+                distance = abs(midpoint - ideal_point)
+                if distance <= search_window and distance < best_distance:
+                    best_distance = distance
+                    best_point = midpoint
+
+            split_point = best_point if best_point is not None else ideal_point
+            split_point = round(split_point, 3)
+            if split_point <= previous_point + 0.001:
+                break
+
+            split_points.append(split_point)
+            previous_point = split_point
+            ideal_point = split_point + self.split_duration_sec
+
+        return split_points
+
+    def _build_segment_ranges(self, duration: float,
+                              split_points: List[float]) -> List[Tuple[float, float]]:
+        points = [0.0]
+        for point in split_points:
+            if 0 < point < duration and point > points[-1] + 0.001:
+                points.append(point)
+        points.append(duration)
+
+        ranges = []
+        for index in range(len(points) - 1):
+            start = round(points[index], 3)
+            end = round(points[index + 1], 3)
+            if end > start + 0.001:
+                ranges.append((start, end))
+        return ranges
+
+    def _export_audio_segment(self, audio_path: str, chunk_path: str,
+                              start: float, end: float):
+        duration = max(0.001, end - start)
+        command = [
+            "ffmpeg", "-hide_banner", "-nostdin", "-y",
+            "-i", audio_path,
+            "-ss", f"{start:.3f}",
+            "-t", f"{duration:.3f}",
+            "-map", "0:a:0",
+            "-vn",
+            "-c:a", "libmp3lame",
+            "-b:a", "192k",
+            chunk_path
+        ]
+
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            startupinfo=self._startupinfo()
+        )
+
+    def _startupinfo(self):
+        if sys.platform != "win32":
+            return None
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        return startupinfo
+
+    def _ensure_chunk_offsets(self):
+        if len(self.chunk_offsets) == len(self.temp_chunks):
+            try:
+                self.chunk_offsets = [float(offset) for offset in self.chunk_offsets]
+                return
+            except (TypeError, ValueError):
+                pass
+
+        self.chunk_offsets = [
+            round(index * self.split_duration_sec, 3)
+            for index in range(len(self.temp_chunks))
+        ]
+
+    def _get_chunk_offset(self, chunk_index: int) -> float:
+        self._ensure_chunk_offsets()
+        if 0 <= chunk_index < len(self.chunk_offsets):
+            return float(self.chunk_offsets[chunk_index])
+        return round(chunk_index * self.split_duration_sec, 3)
+
+    def _copy_transcript_with_offset(self, transcript_json: dict, offset: float) -> dict:
+        adjusted = transcript_json.copy()
+        if "words" not in transcript_json:
+            return adjusted
+
+        adjusted_words = []
+        for word in transcript_json.get("words", []):
+            adjusted_word = word.copy()
+            for key in ("start", "end"):
+                if isinstance(adjusted_word.get(key), (int, float)):
+                    adjusted_word[key] = round(adjusted_word[key] + offset, 3)
+            adjusted_words.append(adjusted_word)
+
+        adjusted["words"] = adjusted_words
+        return adjusted
+
+    def _cleanup_owned_chunk_artifacts(self):
+        for chunk_path in list(getattr(self, "owned_temp_chunks", [])):
+            try:
+                if chunk_path and os.path.exists(chunk_path):
+                    os.remove(chunk_path)
+                if chunk_path:
+                    json_path = os.path.splitext(chunk_path)[0] + ".json"
+                    if os.path.exists(json_path):
+                        os.remove(json_path)
+            except OSError:
+                pass
+
+        self.owned_temp_chunks = []
+        self._remove_temp_chunk_dir(log=False)
+
+    def _remove_temp_chunk_dir(self, log: bool):
+        temp_chunk_dir = getattr(self, "temp_chunk_dir", None)
+        if not temp_chunk_dir:
+            return
+
+        if not self._is_owned_temp_chunk_dir(temp_chunk_dir):
+            if log:
+                self.log_message.emit(f"跳过未知临时切片目录: {temp_chunk_dir}")
+            self.temp_chunk_dir = None
+            return
+
+        if os.path.isdir(temp_chunk_dir):
+            try:
+                shutil.rmtree(temp_chunk_dir)
+                if log:
+                    self.log_message.emit(f"已删除临时切片目录: {os.path.basename(temp_chunk_dir)}")
+            except OSError as e:
+                if log:
+                    self.log_message.emit(f"清理临时切片目录失败: {e}")
+        self.temp_chunk_dir = None
+
+    def _is_owned_temp_chunk_dir(self, path: str) -> bool:
+        name = os.path.basename(os.path.normpath(path))
+        return "_chunks_" in name
 
     def _process_next_chunk(self):
         """处理下一个待处理的音频片段。"""
@@ -296,7 +542,8 @@ class Worker(QObject):
             tag_audio_events=self.tag_audio_events,
             ffmpeg_available=self.ffmpeg_available,
             log_callback=lambda msg: self.log_message.emit(msg),
-            chunk_indices=list(range(self.total_chunks))
+            chunk_indices=list(range(self.total_chunks)),
+            chunk_offsets=self.chunk_offsets
         )
 
         if not success:
@@ -305,7 +552,7 @@ class Worker(QObject):
     def _process_chunks_sequential(self):
         """顺序处理音频片段（原有逻辑）"""
         if self.current_chunk_index < self.total_chunks:
-            self.time_offset = self.current_chunk_index * self.split_duration_sec
+            self.time_offset = self._get_chunk_offset(self.current_chunk_index)
             chunk_path = self.temp_chunks[self.current_chunk_index]
 
             self.log_message.emit("-" * 20)
@@ -369,7 +616,8 @@ class Worker(QObject):
             tag_audio_events=self.tag_audio_events,
             ffmpeg_available=self.ffmpeg_available,
             log_callback=lambda msg: self.log_message.emit(msg),
-            chunk_indices=remaining_indices
+            chunk_indices=remaining_indices,
+            chunk_offsets=self.chunk_offsets
         )
 
         if not success:
@@ -570,6 +818,10 @@ class Worker(QObject):
     def on_upload_finished(self, transcript_json):
         """当一个片段上传和转录成功时调用。"""
         self.log_message.emit(f"片段 {self.current_chunk_index + 1}/{self.total_chunks} 转录成功。")
+        adjusted_transcript = self._copy_transcript_with_offset(
+            transcript_json,
+            self._get_chunk_offset(self.current_chunk_index)
+        )
         
         # 保存分段的 JSON 文件以供调试
         try:
@@ -577,20 +829,12 @@ class Worker(QObject):
             base_chunk_path, _ = os.path.splitext(chunk_path)
             segment_json_path = base_chunk_path + ".json"
             with open(segment_json_path, 'w', encoding='utf-8') as f:
-                json.dump(transcript_json, f, ensure_ascii=False, indent=4)
+                json.dump(adjusted_transcript, f, ensure_ascii=False, indent=4)
             self.log_message.emit(f"分段转录JSON已保存到: {os.path.basename(segment_json_path)}")
         except Exception as e:
             self.log_message.emit(f"警告：保存分段JSON文件失败: {e}")
 
-        if not self.combined_transcript:
-            self.combined_transcript = transcript_json
-        else:
-            words = transcript_json.get("words", [])
-            for word in words:
-                word["start"] = round(word["start"] + self.time_offset, 3)
-                word["end"] = round(word["end"] + self.time_offset, 3)
-            self.combined_transcript["words"].extend(words)
-            self.combined_transcript["text"] += " " + transcript_json.get("text", "")
+        self._append_transcript(adjusted_transcript)
         
         self.current_chunk_index += 1
         
@@ -726,6 +970,8 @@ class Worker(QObject):
                     chunk_name = os.path.basename(chunk_path) if chunk_path else "未知文件"
                     self.log_message.emit(f"清理文件 {chunk_name} 失败: {e}")
             self.owned_temp_chunks = []
+
+        self._remove_temp_chunk_dir(log=True)
 
         # 清理提取的音频文件（如果是从视频提取的）
         if (hasattr(self, 'original_file_path') and self.original_file_path and

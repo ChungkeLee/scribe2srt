@@ -124,6 +124,22 @@ def test_chunk_retry_sleep_stops_when_cancelled(monkeypatch):
     assert sleep_calls == [0.2]
 
 
+def test_async_time_offsets_prefer_recorded_chunk_offsets():
+    processor = AsyncChunkProcessor()
+
+    offsets = processor._build_time_offsets(
+        chunk_indices=[1, 3, 5],
+        split_duration_sec=60,
+        chunk_offsets=[0.0, 58.75, 119.0, 179.25],
+    )
+
+    assert offsets == {
+        1: 58.75,
+        3: 179.25,
+        5: 300.0,
+    }
+
+
 def test_worker_does_not_fallback_after_async_cancellation(monkeypatch):
     worker = Worker(
         file_path="placeholder.mp3",
@@ -149,6 +165,78 @@ def test_worker_does_not_fallback_after_async_cancellation(monkeypatch):
 
     assert fallback_calls == []
     assert errors == ["用户取消了任务"]
+
+
+def test_worker_uses_recorded_offset_for_sequential_chunk(monkeypatch):
+    worker = Worker(
+        file_path="placeholder.mp3",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+    worker.total_chunks = 3
+    worker.current_chunk_index = 1
+    worker.temp_chunks = ["chunk-0.mp3", "chunk-1.mp3", "chunk-2.mp3"]
+    worker.chunk_offsets = [0.0, 59.321, 121.2]
+
+    processed = []
+    monkeypatch.setattr(
+        worker,
+        "_process_single_file",
+        lambda path: processed.append((path, worker.time_offset)),
+    )
+
+    worker._process_chunks_sequential()
+
+    assert processed == [("chunk-1.mp3", 59.321)]
+
+
+def test_worker_offsets_first_processed_restored_chunk(tmp_path, monkeypatch):
+    worker = Worker(
+        file_path=str(tmp_path / "placeholder.mp3"),
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+    worker.total_chunks = 2
+    worker.current_chunk_index = 1
+    worker.temp_chunks = [
+        str(tmp_path / "chunk-0.mp3"),
+        str(tmp_path / "chunk-1.mp3"),
+    ]
+    worker.chunk_offsets = [0.0, 12.5]
+    finalized = []
+    monkeypatch.setattr(worker, "_finalize_task", lambda: finalized.append(True))
+
+    worker.on_upload_finished({
+        "text": "late",
+        "words": [
+            {"text": "late", "type": "word", "start": 0.2, "end": 0.8}
+        ],
+    })
+
+    assert finalized == [True]
+    assert worker.combined_transcript["words"][0]["start"] == 12.7
+    assert worker.combined_transcript["words"][0]["end"] == 13.3
+
+
+def test_worker_smart_split_points_prefer_nearby_silence():
+    worker = Worker(
+        file_path="placeholder.mp3",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+
+    split_points = worker._calculate_smart_split_points(
+        duration=180.0,
+        silence_ranges=[(57.0, 59.0), (119.5, 121.5)],
+    )
+
+    assert split_points == [58.0, 120.5]
 
 
 def test_language_utils_identifies_cjk_codes():

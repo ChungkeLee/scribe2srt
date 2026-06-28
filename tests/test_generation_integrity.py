@@ -259,6 +259,7 @@ def test_async_get_state_uses_restorable_base_index():
     )
     worker.current_chunk_index = 4
     worker.async_base_chunk_index = 2
+    worker.chunk_offsets = [0.0, 58.75, 119.5, 181.0]
     worker.async_processor = SimpleNamespace(
         get_progress_info=lambda: {
             "total_chunks": 3,
@@ -273,3 +274,4 @@ def test_async_get_state_uses_restorable_base_index():
 
     assert state["current_chunk_index"] == 2
     assert state["async_progress"]["processing_chunks"] == 1
+    assert state["chunk_offsets"] == [0.0, 58.75, 119.5, 181.0]
