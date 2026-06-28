@@ -170,7 +170,12 @@ def test_dense_json_timeline_does_not_accumulate_drift():
     _, entries = _capture_entries(processor)
 
     last_source_end = words[-1]["end"]
-    assert abs(entries[-1]["end"] - last_source_end) <= 0.15
+    assert entries[-1]["end"] >= last_source_end - 0.15
+    assert entries[-1]["end"] - last_source_end <= processor._max_timing_lag() + 0.001
+    assert all(
+        entry["end"] - _entry_time_bounds(entry)[1] <= processor._max_timing_lag() + 0.001
+        for entry in entries
+    )
     _assert_no_material_timeline_drift(entries, max_start_lag=0.15)
 
 

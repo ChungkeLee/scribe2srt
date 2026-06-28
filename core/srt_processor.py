@@ -205,6 +205,7 @@ class SrtProcessor:
         all_entries = self._split_entries_by_constraints(all_entries)
         all_entries = [self._apply_terminal_punctuation(entry) for entry in all_entries]
         all_entries = self._normalize_timeline(all_entries)
+        all_entries = self._repair_timing_pressure(all_entries)
 
         # Stage 5: Generate final SRT content with optimized display formatting
         return self._generate_final_srt_content(all_entries)
@@ -540,6 +541,224 @@ class SrtProcessor:
 
         _, source_end = self._entry_time_bounds(entry)
         return max(source_end, entry['start'] + 0.001)
+
+    def _repair_timing_pressure(self, entries: List[Dict]) -> List[Dict]:
+        """Reduce flash subtitles and tiny gaps without allowing cumulative drift."""
+        if not entries:
+            return []
+
+        repaired = self._merge_timing_pressure_entries(entries)
+        repaired = self._normalize_timeline(repaired)
+        repaired = self._extend_entries_with_local_room(repaired)
+        repaired = self._enforce_minimum_gaps_locally(repaired)
+        repaired = self._extend_entries_with_local_room(repaired)
+        return repaired
+
+    def _merge_timing_pressure_entries(self, entries: List[Dict]) -> List[Dict]:
+        repaired = sorted((entry.copy() for entry in entries), key=lambda x: x['start'])
+
+        for _ in range(4):
+            merged = []
+            changed = False
+            index = 0
+
+            while index < len(repaired):
+                current = repaired[index].copy()
+
+                while index + 1 < len(repaired):
+                    next_entry = repaired[index + 1]
+                    if not self._can_merge_timing_pressure_entries(current, next_entry):
+                        break
+
+                    current = self._merge_two_post_entries(current, next_entry)
+                    changed = True
+                    index += 1
+
+                merged.append(current)
+                index += 1
+
+            repaired = merged
+            if not changed:
+                break
+
+        return repaired
+
+    def _can_merge_timing_pressure_entries(self, entry1: Dict, entry2: Dict) -> bool:
+        if entry1.get('is_audio_event', False) or entry2.get('is_audio_event', False):
+            return False
+
+        gap = entry2['start'] - entry1['end']
+        if gap < -0.001 or gap > 0.5:
+            return False
+
+        duration1 = entry1['end'] - entry1['start']
+        duration2 = entry2['end'] - entry2['start']
+        cps1 = self._calculate_cps(entry1.get('text', ''), max(0.001, duration1))
+        cps2 = self._calculate_cps(entry2.get('text', ''), max(0.001, duration2))
+        has_timing_pressure = (
+            duration1 < self.min_subtitle_duration or
+            duration2 < self.min_subtitle_duration or
+            gap < self.min_subtitle_gap or
+            (gap <= 0.25 and (cps1 > self.max_cps or cps2 > self.max_cps))
+        )
+        if not has_timing_pressure:
+            return False
+
+        has_sentence_end, _, priority = PunctuationHandler.word_ends_with_punctuation(
+            entry1.get('text', '')
+        )
+        if (
+            has_sentence_end and priority == 0 and
+            gap >= self.min_subtitle_gap and
+            duration1 >= self.min_subtitle_duration and
+            duration2 >= self.min_subtitle_duration
+        ):
+            return False
+
+        merged_text = self._join_text(entry1.get('text', ''), entry2.get('text', ''))
+        lines = self._wrap_text_unlimited(merged_text)
+        if len(lines) > 2:
+            return False
+        if any(len(line) > self.max_chars_per_line for line in lines):
+            return False
+
+        merged_entry = self._merge_two_post_entries(entry1, entry2)
+        source_start, source_end = self._entry_time_bounds(merged_entry)
+        source_duration = source_end - source_start
+        if source_duration > self.max_subtitle_duration:
+            return False
+        if self._required_duration_for_cps(merged_text) > self.max_subtitle_duration:
+            return False
+
+        merged_duration = max(0.001, entry2['end'] - entry1['start'])
+        merged_cps = self._calculate_cps(merged_text, merged_duration)
+        if (
+            gap >= self.min_subtitle_gap and
+            merged_cps > max(self.max_cps, cps1, cps2) + 0.001
+        ):
+            return False
+
+        return True
+
+    def _extend_entries_with_local_room(self, entries: List[Dict]) -> List[Dict]:
+        repaired = sorted((entry.copy() for entry in entries), key=lambda x: x['start'])
+        if not repaired:
+            return []
+
+        for index, entry in enumerate(repaired):
+            if entry.get('is_audio_event', False):
+                continue
+
+            required_duration = self._required_display_duration_for_entry(entry)
+            current_duration = entry['end'] - entry['start']
+            if current_duration + 0.001 >= required_duration:
+                continue
+
+            previous_end = repaired[index - 1]['end'] if index > 0 else 0.0
+            next_start = repaired[index + 1]['start'] if index + 1 < len(repaired) else float('inf')
+            lower_bound = previous_end + self.min_subtitle_gap if index > 0 else 0.0
+            upper_bound = next_start - self.min_subtitle_gap
+
+            source_start, source_end = self._entry_time_bounds(entry)
+            max_lead = self._max_timing_lead()
+            max_lag = self._max_timing_lag()
+
+            needed = required_duration - current_duration
+            if needed <= 0:
+                continue
+
+            earlier_start = max(
+                lower_bound,
+                source_start - max_lead,
+                entry['start'] - needed
+            )
+            if earlier_start < entry['start']:
+                entry['start'] = earlier_start
+
+            current_duration = entry['end'] - entry['start']
+            needed = required_duration - current_duration
+            if needed <= 0:
+                continue
+
+            later_end = min(
+                upper_bound,
+                source_end + max_lag,
+                entry['end'] + needed,
+                entry['start'] + self.max_subtitle_duration
+            )
+            if later_end > entry['end']:
+                entry['end'] = later_end
+
+            if entry['end'] <= entry['start']:
+                entry['end'] = entry['start'] + 0.001
+
+        return repaired
+
+    def _enforce_minimum_gaps_locally(self, entries: List[Dict]) -> List[Dict]:
+        repaired = sorted((entry.copy() for entry in entries), key=lambda x: x['start'])
+
+        for index in range(1, len(repaired)):
+            previous = repaired[index - 1]
+            current = repaired[index]
+            if previous.get('is_audio_event', False) or current.get('is_audio_event', False):
+                continue
+
+            gap = current['start'] - previous['end']
+            if gap < 0 or gap + 0.001 >= self.min_subtitle_gap:
+                continue
+
+            needed = self.min_subtitle_gap - gap
+            current_source_start, _ = self._entry_time_bounds(current)
+            next_start = repaired[index + 1]['start'] if index + 1 < len(repaired) else float('inf')
+            max_end_after_shift = min(
+                next_start - self.min_subtitle_gap,
+                self._entry_time_bounds(current)[1] + self._max_timing_lag(),
+                current['start'] + needed + self.max_subtitle_duration
+            )
+            required_after_shift = self._required_display_duration_for_entry(current)
+            shifted_start = current['start'] + needed
+            duration_after_shift = current['end'] - shifted_start
+            can_keep_min_duration = duration_after_shift >= self.min_subtitle_duration - 0.001
+            can_restore_required_duration = (
+                max_end_after_shift - shifted_start >=
+                min(required_after_shift, self.max_subtitle_duration) - 0.001
+            )
+
+            if (
+                shifted_start <= current_source_start + self._max_late_start_shift() + 0.001 and
+                (can_keep_min_duration or can_restore_required_duration)
+            ):
+                current['start'] = shifted_start
+                continue
+
+            previous_source_end = self._entry_time_bounds(previous)[1]
+            min_previous_end = max(
+                previous_source_end,
+                previous['start'] + min(self.min_subtitle_duration, previous['end'] - previous['start'])
+            )
+            trimmed_end = previous['end'] - needed
+            if trimmed_end >= min_previous_end - 0.001:
+                previous['end'] = trimmed_end
+
+        return repaired
+
+    def _required_display_duration_for_entry(self, entry: Dict) -> float:
+        source_start, source_end = self._entry_time_bounds(entry)
+        coverage_duration = max(0.001, source_end - source_start)
+        return self._target_display_duration(
+            entry,
+            coverage_duration,
+            entry.get('is_audio_event', False)
+        )
+
+    def _max_timing_lead(self) -> float:
+        return min(1.5, max(0.5, self.min_subtitle_duration))
+
+    def _max_timing_lag(self) -> float:
+        return 0.25
+
+    def _max_late_start_shift(self) -> float:
+        return max(0.12, self.min_subtitle_gap)
 
     def _entry_time_bounds(self, entry: Dict) -> tuple:
         timed_items = [

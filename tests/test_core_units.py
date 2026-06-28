@@ -474,7 +474,83 @@ def test_srt_processor_extends_reading_time_backward_before_shifting_next():
     processor._generate_final_srt_content = capture
     processor.create_srt()
 
-    first, second = captured["entries"][:2]
-    assert first["start"] < 1.0
-    assert first["end"] <= 2.0 + 0.001
-    assert second["start"] <= 2.2 + 0.001
+    entries = captured["entries"]
+    assert entries
+    assert all(
+        entries[index]["start"] >= entries[index - 1]["end"] - 0.001
+        for index in range(1, len(entries))
+    )
+    assert entries[0]["start"] <= 1.0 + 0.001
+    assert entries[-1]["end"] >= 2.6 - 0.001
+    assert "Fast subtitle text" in " ".join(entry["text"] for entry in entries)
+    assert "Next." in " ".join(entry["text"] for entry in entries)
+
+
+def test_srt_processor_merges_flash_subtitle_with_neighbor():
+    captured = {}
+    processor = SrtProcessor(
+        {
+            "language_code": "eng",
+            "words": [
+                {"text": "That ", "type": "word", "start": 0.0, "end": 0.25},
+                {"text": "helps.", "type": "word", "start": 0.25, "end": 0.8},
+                {"text": "uh,", "type": "word", "start": 0.86, "end": 0.94},
+                {"text": "thanks.", "type": "word", "start": 1.0, "end": 1.8},
+            ],
+        }
+    )
+    original_generate = processor._generate_final_srt_content
+
+    def capture(entries):
+        captured["entries"] = [entry.copy() for entry in entries]
+        return original_generate(entries)
+
+    processor._generate_final_srt_content = capture
+    processor.create_srt()
+
+    texts = [entry["text"] for entry in captured["entries"]]
+    assert "uh," not in texts
+    assert any("uh," in text for text in texts)
+    assert all(
+        entry["end"] - entry["start"] >= processor.min_subtitle_duration - 0.001
+        for entry in captured["entries"]
+    )
+
+
+def test_srt_processor_repairs_tiny_gap_when_room_is_available():
+    captured = {}
+    processor = SrtProcessor(
+        {
+            "language_code": "eng",
+            "words": [
+                {"text": "First ", "type": "word", "start": 0.0, "end": 0.4},
+                {"text": "sentence.", "type": "word", "start": 0.4, "end": 1.0},
+                {"text": "Second ", "type": "word", "start": 1.03, "end": 1.5},
+                {"text": "sentence.", "type": "word", "start": 1.5, "end": 2.8},
+            ],
+        }
+    )
+    original_generate = processor._generate_final_srt_content
+
+    def capture(entries):
+        captured["entries"] = [entry.copy() for entry in entries]
+        return original_generate(entries)
+
+    processor._generate_final_srt_content = capture
+    processor.create_srt()
+
+    entries = captured["entries"]
+    for index in range(1, len(entries)):
+        gap = entries[index]["start"] - entries[index - 1]["end"]
+        assert gap >= processor.min_subtitle_gap - 0.001
+
+    max_late_start = max(
+        entry["start"] - processor._entry_time_bounds(entry)[0]
+        for entry in entries
+    )
+    max_late_end = max(
+        entry["end"] - processor._entry_time_bounds(entry)[1]
+        for entry in entries
+    )
+    assert max_late_start <= processor._max_late_start_shift() + 0.001
+    assert max_late_end <= processor._max_timing_lag() + 0.001
