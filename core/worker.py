@@ -343,17 +343,23 @@ class Worker(QObject):
             max(1.0, self.split_duration_sec * 0.8)
         )
         search_window = min(300.0, max(10.0, self.split_duration_sec * 0.15))
+        max_silence_overrun = min(5.0, max(2.5, self.split_duration_sec * 0.02))
 
         while ideal_point < duration:
             if duration - ideal_point < min_segment_duration:
-                break
+                merged_tail_duration = duration - previous_point
+                if merged_tail_duration <= self.split_duration_sec + max_silence_overrun:
+                    break
 
             best_point = None
             best_distance = float("inf")
+            latest_allowed_point = previous_point + self.split_duration_sec + max_silence_overrun
 
             for silence_start, silence_end in silence_ranges:
                 midpoint = (silence_start + silence_end) / 2
                 if midpoint <= previous_point + min_segment_duration:
+                    continue
+                if midpoint > latest_allowed_point:
                     continue
                 if duration - midpoint < min_segment_duration:
                     continue
@@ -365,6 +371,10 @@ class Worker(QObject):
 
             split_point = best_point if best_point is not None else ideal_point
             split_point = round(split_point, 3)
+            if duration - split_point < min_segment_duration:
+                merged_tail_duration = duration - previous_point
+                if merged_tail_duration <= self.split_duration_sec + max_silence_overrun:
+                    break
             if split_point <= previous_point + 0.001:
                 break
 
@@ -458,7 +468,8 @@ class Worker(QObject):
         return adjusted
 
     def _cleanup_owned_chunk_artifacts(self):
-        for chunk_path in list(getattr(self, "owned_temp_chunks", [])):
+        owned_paths = list(getattr(self, "owned_temp_chunks", []))
+        for chunk_path in owned_paths:
             try:
                 if chunk_path and os.path.exists(chunk_path):
                     os.remove(chunk_path)
@@ -470,14 +481,14 @@ class Worker(QObject):
                 pass
 
         self.owned_temp_chunks = []
-        self._remove_temp_chunk_dir(log=False)
+        self._remove_temp_chunk_dir(log=False, owned_paths=owned_paths)
 
-    def _remove_temp_chunk_dir(self, log: bool):
+    def _remove_temp_chunk_dir(self, log: bool, owned_paths: Optional[List[str]] = None):
         temp_chunk_dir = getattr(self, "temp_chunk_dir", None)
         if not temp_chunk_dir:
             return
 
-        if not self._is_owned_temp_chunk_dir(temp_chunk_dir):
+        if not self._is_owned_temp_chunk_dir(temp_chunk_dir, owned_paths):
             if log:
                 self.log_message.emit(f"跳过未知临时切片目录: {temp_chunk_dir}")
             self.temp_chunk_dir = None
@@ -493,9 +504,30 @@ class Worker(QObject):
                     self.log_message.emit(f"清理临时切片目录失败: {e}")
         self.temp_chunk_dir = None
 
-    def _is_owned_temp_chunk_dir(self, path: str) -> bool:
-        name = os.path.basename(os.path.normpath(path))
-        return "_chunks_" in name
+    def _is_owned_temp_chunk_dir(self, path: str, owned_paths: Optional[List[str]] = None) -> bool:
+        try:
+            resolved_dir = os.path.abspath(path)
+            name = os.path.basename(os.path.normpath(resolved_dir))
+            if "_chunks_" not in name:
+                return False
+
+            paths = owned_paths if owned_paths is not None else getattr(self, "owned_temp_chunks", [])
+            paths = [chunk_path for chunk_path in paths if chunk_path]
+            if paths:
+                prefix = os.path.normcase(resolved_dir.rstrip(os.sep) + os.sep)
+                return all(
+                    os.path.normcase(os.path.abspath(chunk_path)).startswith(prefix)
+                    for chunk_path in paths
+                )
+
+            allowed_parents = {
+                os.path.normcase(os.path.dirname(os.path.abspath(path_value)))
+                for path_value in (getattr(self, "file_path", None), getattr(self, "original_file_path", None))
+                if path_value
+            }
+            return os.path.normcase(os.path.dirname(resolved_dir)) in allowed_parents
+        except (TypeError, ValueError, OSError):
+            return False
 
     def _process_next_chunk(self):
         """处理下一个待处理的音频片段。"""
@@ -952,6 +984,7 @@ class Worker(QObject):
         self.log_message.emit("正在清理所有临时音频片段...")
 
         # 清理音频片段文件
+        owned_chunk_paths = list(self.owned_temp_chunks)
         if self.owned_temp_chunks:
             for chunk_path in self.owned_temp_chunks:
                 try:
@@ -971,7 +1004,7 @@ class Worker(QObject):
                     self.log_message.emit(f"清理文件 {chunk_name} 失败: {e}")
             self.owned_temp_chunks = []
 
-        self._remove_temp_chunk_dir(log=True)
+        self._remove_temp_chunk_dir(log=True, owned_paths=owned_chunk_paths)
 
         # 清理提取的音频文件（如果是从视频提取的）
         if (hasattr(self, 'original_file_path') and self.original_file_path and

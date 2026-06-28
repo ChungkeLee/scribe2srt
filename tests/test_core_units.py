@@ -239,6 +239,87 @@ def test_worker_smart_split_points_prefer_nearby_silence():
     assert split_points == [58.0, 120.5]
 
 
+def test_worker_splits_slightly_over_threshold_duration():
+    worker = Worker(
+        file_path="placeholder.mp3",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+
+    split_points = worker._calculate_smart_split_points(
+        duration=85.0,
+        silence_ranges=[],
+    )
+    ranges = worker._build_segment_ranges(85.0, split_points)
+
+    assert split_points == [60.0]
+    assert ranges == [(0.0, 60.0), (60.0, 85.0)]
+
+
+def test_worker_splits_long_tail_that_would_exceed_threshold():
+    worker = Worker(
+        file_path="placeholder.mp3",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=40,
+    )
+
+    split_points = worker._calculate_smart_split_points(
+        duration=2700.0,
+        silence_ranges=[],
+    )
+    ranges = worker._build_segment_ranges(2700.0, split_points)
+
+    assert split_points == [2400.0]
+    assert ranges == [(0.0, 2400.0), (2400.0, 2700.0)]
+
+
+def test_worker_smart_split_does_not_overrun_too_far_for_late_silence():
+    worker = Worker(
+        file_path="placeholder.mp3",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+
+    split_points = worker._calculate_smart_split_points(
+        duration=180.0,
+        silence_ranges=[(66.0, 68.0), (126.0, 128.0)],
+    )
+    ranges = worker._build_segment_ranges(180.0, split_points)
+
+    assert split_points == [60.0, 120.0]
+    assert ranges == [(0.0, 60.0), (60.0, 120.0), (120.0, 180.0)]
+
+
+def test_worker_temp_chunk_dir_requires_owned_chunk_paths(tmp_path):
+    source_path = tmp_path / "source.mp3"
+    chunk_dir = tmp_path / "source_chunks_test"
+    chunk_dir.mkdir()
+
+    worker = Worker(
+        file_path=str(source_path),
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+
+    owned_chunk = chunk_dir / "source_chunk_000.mp3"
+    outside_chunk = tmp_path / "source_chunk_000.mp3"
+
+    assert worker._is_owned_temp_chunk_dir(str(chunk_dir), [str(owned_chunk)])
+    assert not worker._is_owned_temp_chunk_dir(str(chunk_dir), [str(outside_chunk)])
+    assert not worker._is_owned_temp_chunk_dir(
+        str(tmp_path / "source_segments_test"),
+        [str(owned_chunk)],
+    )
+
+
 def test_language_utils_identifies_cjk_codes():
     assert normalize_language_code("Japanese") == "jap"
     assert is_cjk_language("jpn")
