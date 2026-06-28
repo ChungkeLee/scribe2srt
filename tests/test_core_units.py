@@ -320,6 +320,45 @@ def test_worker_temp_chunk_dir_requires_owned_chunk_paths(tmp_path):
     )
 
 
+def test_worker_chunk_extension_follows_source_audio_container():
+    worker = Worker(
+        file_path="placeholder.ogg",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+
+    assert worker._chunk_extension_for_audio("source.ogg") == ".ogg"
+    assert worker._chunk_extension_for_audio("source.m4a") == ".m4a"
+    assert worker._chunk_extension_for_audio("source") == ".mka"
+
+
+def test_worker_export_audio_segment_uses_stream_copy(monkeypatch):
+    worker = Worker(
+        file_path="placeholder.ogg",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+
+    monkeypatch.setattr("core.worker.subprocess.run", fake_run)
+
+    worker._export_audio_segment("source.ogg", "chunk_000.ogg", 1.25, 4.75)
+
+    command, kwargs = calls[0]
+    assert command[command.index("-c:a") + 1] == "copy"
+    assert "libmp3lame" not in command
+    assert "-b:a" not in command
+    assert command[-1] == "chunk_000.ogg"
+    assert kwargs["check"] is True
+
+
 def test_language_utils_identifies_cjk_codes():
     assert normalize_language_code("Japanese") == "jap"
     assert is_cjk_language("jpn")

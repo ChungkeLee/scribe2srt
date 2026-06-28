@@ -247,12 +247,20 @@ class Worker(QObject):
             else:
                 self.log_message.emit("未检测到可用静音点，将使用固定时间切分。")
 
+            chunk_extension = self._chunk_extension_for_audio(audio_path)
+            self.log_message.emit(
+                f"分片将使用原始音频编码流复制，输出容器: {chunk_extension}"
+            )
+
             self.owned_temp_chunks = []
             self.temp_chunks = []
             self.chunk_offsets = []
 
             for index, (start, end) in enumerate(segment_ranges):
-                chunk_path = os.path.join(self.temp_chunk_dir, f"{base_name}_chunk_{index:03d}.mp3")
+                chunk_path = os.path.join(
+                    self.temp_chunk_dir,
+                    f"{base_name}_chunk_{index:03d}{chunk_extension}"
+                )
                 self._export_audio_segment(audio_path, chunk_path, start, end)
                 self.owned_temp_chunks.append(chunk_path)
                 self.temp_chunks.append(chunk_path)
@@ -400,6 +408,10 @@ class Worker(QObject):
                 ranges.append((start, end))
         return ranges
 
+    def _chunk_extension_for_audio(self, audio_path: str) -> str:
+        extension = os.path.splitext(audio_path)[1].lower()
+        return extension or ".mka"
+
     def _export_audio_segment(self, audio_path: str, chunk_path: str,
                               start: float, end: float):
         duration = max(0.001, end - start)
@@ -410,8 +422,8 @@ class Worker(QObject):
             "-t", f"{duration:.3f}",
             "-map", "0:a:0",
             "-vn",
-            "-c:a", "libmp3lame",
-            "-b:a", "192k",
+            "-c:a", "copy",
+            "-avoid_negative_ts", "make_zero",
             chunk_path
         ]
 
