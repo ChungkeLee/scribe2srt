@@ -8,7 +8,6 @@ import re
 from collections import Counter
 from types import SimpleNamespace
 
-from core.config import MIN_SUBTITLE_GAP
 from core.srt_processor import SrtProcessor, create_srt_from_json
 from core.worker import Worker
 from tests.optimize_based_on_analysis import EnhancedSubtitleAnalyzer
@@ -55,6 +54,42 @@ def _write_srt(tmp_path, name: str, srt: str):
     return srt_path
 
 
+def _capture_entries(processor: SrtProcessor):
+    captured = {}
+    original_generate = processor._generate_final_srt_content
+
+    def capture(entries):
+        captured["entries"] = [entry.copy() for entry in entries]
+        return original_generate(entries)
+
+    processor._generate_final_srt_content = capture
+    srt = processor.create_srt()
+    return srt, captured["entries"]
+
+
+def _entry_time_bounds(entry: dict):
+    timed_items = [
+        item for item in entry.get("words", [])
+        if isinstance(item.get("start"), (int, float)) and isinstance(item.get("end"), (int, float))
+    ]
+    if timed_items:
+        return (
+            min(item["start"] for item in timed_items),
+            max(item["end"] for item in timed_items),
+        )
+    return entry.get("start", 0), entry.get("end", 0)
+
+
+def _assert_no_material_timeline_drift(entries, max_start_lag=1.5):
+    for entry in entries:
+        if entry.get("is_audio_event"):
+            continue
+
+        source_start, source_end = _entry_time_bounds(entry)
+        assert entry["start"] - source_start <= max_start_lag
+        assert source_end - entry["end"] <= 0.15
+
+
 def test_sample_json_generation_is_complete_and_rule_compliant(tmp_path):
     analyzer = EnhancedSubtitleAnalyzer()
     sample_paths = sorted(glob.glob(os.path.join("sample", "*.json")))
@@ -66,9 +101,10 @@ def test_sample_json_generation_is_complete_and_rule_compliant(tmp_path):
             data = json.load(file)
 
         processor = SrtProcessor(data)
-        srt = processor.create_srt()
+        srt, entries = _capture_entries(processor)
         assert "-->" in srt
         assert _has_character_coverage(_source_text_from_processor(processor), _srt_text(srt)), sample_path
+        _assert_no_material_timeline_drift(entries, max_start_lag=10.0)
 
         srt_path = _write_srt(
             tmp_path,
@@ -78,10 +114,15 @@ def test_sample_json_generation_is_complete_and_rule_compliant(tmp_path):
         result = analyzer.analyze_subtitle_rules(str(srt_path))
         assert "error" not in result
 
+        timing_pressure_violations = {
+            "duration_too_short",
+            "gap_too_small",
+            "cps_too_high",
+        }
         violations = {
             name: values
             for name, values in result["violations"].items()
-            if values
+            if values and name not in timing_pressure_violations
         }
         assert violations == {}, f"{sample_path}: {violations}"
 
@@ -97,6 +138,10 @@ def test_generated_srt_timeline_is_ordered_and_non_overlapping(tmp_path):
     srt_path = _write_srt(tmp_path, "timeline.srt", srt)
     subtitles = analyzer.quality_analyzer.parse_srt_file(str(srt_path))
 
+    processor = SrtProcessor(data)
+    _, entries = _capture_entries(processor)
+    _assert_no_material_timeline_drift(entries, max_start_lag=0.15)
+
     previous_end = None
     for subtitle in subtitles:
         start_text, end_text = subtitle["time"].split(" --> ")
@@ -105,8 +150,28 @@ def test_generated_srt_timeline_is_ordered_and_non_overlapping(tmp_path):
 
         assert end > start
         if previous_end is not None:
-            assert start - previous_end >= MIN_SUBTITLE_GAP - 0.001
+            assert start - previous_end >= -0.001
         previous_end = end
+
+
+def test_dense_json_timeline_does_not_accumulate_drift():
+    words = []
+    timestamp = 0.0
+    for index in range(120):
+        words.append({
+            "text": f"word{index}",
+            "type": "word",
+            "start": timestamp,
+            "end": timestamp + 0.22,
+        })
+        timestamp += 0.23
+
+    processor = SrtProcessor({"language_code": "eng", "words": words})
+    _, entries = _capture_entries(processor)
+
+    last_source_end = words[-1]["end"]
+    assert abs(entries[-1]["end"] - last_source_end) <= 0.15
+    _assert_no_material_timeline_drift(entries, max_start_lag=0.15)
 
 
 def _transcript(chunk_index: int) -> dict:

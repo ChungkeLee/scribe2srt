@@ -446,7 +446,7 @@ class SrtProcessor:
         return penalty
 
     def _normalize_timeline(self, entries: List[Dict]) -> List[Dict]:
-        """Keep final subtitles ordered while preserving their source word time range."""
+        """Keep subtitles synchronized to source word times without cumulative drift."""
         if not entries:
             return []
 
@@ -458,37 +458,18 @@ class SrtProcessor:
             is_audio_event = current.get('is_audio_event', False)
             source_start, source_end = self._entry_time_bounds(current)
             coverage_duration = max(0.001, source_end - source_start)
-            if is_audio_event and coverage_duration > self.max_subtitle_duration:
-                target_duration = self.max_subtitle_duration
-            else:
-                target_duration = max(
-                    coverage_duration,
-                    self.min_subtitle_duration,
-                    self._required_duration_for_cps(current.get('text', ''))
-                )
 
-            if target_duration > self.max_subtitle_duration and coverage_duration <= self.max_subtitle_duration:
-                target_duration = self.max_subtitle_duration
-
-            if not is_audio_event:
-                target_duration = max(target_duration, coverage_duration)
+            target_duration = self._target_display_duration(current, coverage_duration, is_audio_event)
+            current['start'], current['end'] = self._preferred_timing_for_entry(
+                source_start,
+                source_end,
+                target_duration,
+                coverage_duration,
+                is_audio_event
+            )
 
             if normalized:
-                self._trim_previous_entry_for_next_start(normalized[-1], source_start)
-                min_start = normalized[-1]['end'] + self.min_subtitle_gap
-            else:
-                min_start = 0.0
-
-            preferred_start = source_end - target_duration
-            current['start'] = max(0.0, min_start, preferred_start)
-            current['end'] = current['start'] + target_duration
-
-            if not is_audio_event and current['start'] <= source_start and current['end'] < source_end:
-                current['end'] = source_end
-
-            if not is_audio_event and current['start'] > source_start:
-                current['start'] = max(min_start, source_start)
-                current['end'] = max(current['end'], source_end)
+                self._resolve_timing_conflict(normalized[-1], current, source_start)
 
             if current['end'] <= current['start']:
                 current['end'] = current['start'] + 0.001
@@ -497,21 +478,68 @@ class SrtProcessor:
 
         return normalized
 
-    def _trim_previous_entry_for_next_start(self, previous: Dict, next_source_start: float):
-        latest_allowed_end = next_source_start - self.min_subtitle_gap
-        if previous.get('end', 0) <= latest_allowed_end:
+    def _target_display_duration(self, entry: Dict, coverage_duration: float, is_audio_event: bool) -> float:
+        if is_audio_event and coverage_duration > self.max_subtitle_duration:
+            return self.max_subtitle_duration
+
+        target_duration = max(
+            coverage_duration,
+            self.min_subtitle_duration,
+            self._required_duration_for_cps(entry.get('text', ''))
+        )
+
+        if coverage_duration <= self.max_subtitle_duration:
+            return min(target_duration, self.max_subtitle_duration)
+
+        return coverage_duration if not is_audio_event else self.max_subtitle_duration
+
+    def _preferred_timing_for_entry(self, source_start: float, source_end: float,
+                                    target_duration: float, coverage_duration: float,
+                                    is_audio_event: bool) -> tuple:
+        if is_audio_event:
+            return source_start, source_start + target_duration
+
+        if coverage_duration > self.max_subtitle_duration:
+            return source_start, source_start + self.max_subtitle_duration
+
+        start = max(0.0, source_end - target_duration)
+        end = max(source_end, start + target_duration)
+        return start, end
+
+    def _resolve_timing_conflict(self, previous: Dict, current: Dict, current_source_start: float):
+        previous_source_start, previous_source_end = self._entry_time_bounds(previous)
+        source_gap = max(0.0, current_source_start - previous_source_end)
+        desired_gap = min(self.min_subtitle_gap, source_gap)
+
+        if previous['end'] + desired_gap <= current['start']:
             return
 
-        previous_source_start, previous_source_end = self._entry_time_bounds(previous)
-        min_required_end = previous['start'] + max(
-            previous_source_end - previous_source_start,
-            min(self.min_subtitle_duration, self.max_subtitle_duration),
-            min(self._required_duration_for_cps(previous.get('text', '')), self.max_subtitle_duration)
-        )
-        min_required_end = max(min_required_end, previous_source_end)
+        if current['start'] < current_source_start:
+            current['start'] = current_source_start
+            if current['end'] <= current['start']:
+                current['end'] = current['start'] + 0.001
 
-        if latest_allowed_end >= min_required_end:
-            previous['end'] = latest_allowed_end
+        latest_previous_end = current['start'] - desired_gap
+        minimum_previous_end = self._minimum_timing_end(previous)
+
+        if previous['end'] > latest_previous_end and latest_previous_end >= minimum_previous_end:
+            previous['end'] = latest_previous_end
+
+        if previous['end'] > current['start']:
+            latest_previous_end = current['start'] - 0.001
+            if latest_previous_end >= minimum_previous_end:
+                previous['end'] = latest_previous_end
+            else:
+                current['start'] = previous['end'] + 0.001
+                if current['end'] <= current['start']:
+                    current['end'] = current['start'] + 0.001
+
+    def _minimum_timing_end(self, entry: Dict) -> float:
+        if entry.get('is_audio_event', False):
+            return entry['start'] + min(self.min_subtitle_duration, self.max_subtitle_duration)
+
+        _, source_end = self._entry_time_bounds(entry)
+        return max(source_end, entry['start'] + 0.001)
 
     def _entry_time_bounds(self, entry: Dict) -> tuple:
         timed_items = [
