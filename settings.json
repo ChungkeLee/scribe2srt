@@ -10,6 +10,5 @@
     "enable_async_processing": true,
     "max_concurrent_chunks": 4,
     "max_retries": 10,
-    "api_rate_limit_per_minute": 30,
-    "pause_threshold": 0.7
+    "api_rate_limit_per_minute": 30
 }

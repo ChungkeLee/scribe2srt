@@ -49,6 +49,7 @@ class Worker(QObject):
 
         # 异步片段处理器
         self.async_processor = None
+        self.async_base_chunk_index = 0
         # 从恢复状态或使用传入参数配置异步处理
         if self.restore_state:
             self.enable_async_processing = self.restore_state.get("enable_async_processing", enable_async_processing)
@@ -83,19 +84,26 @@ class Worker(QObject):
             self.was_single_file_mode = False
             self.extracted_audio_file = None
 
+        self._cancellation_reported = False
+
     def get_state(self) -> Dict[str, Any]:
         """获取当前worker的状态，用于任务恢复。"""
         # 获取异步处理器的进度信息
         async_progress = {}
+        restorable_chunk_index = self.current_chunk_index
         if self.async_processor:
             async_progress = self.async_processor.get_progress_info()
+            # 异步处理时 current_chunk_index 会被上传进度用于 UI 显示，
+            # 不能作为可恢复的连续完成位置。恢复时从本轮异步处理的起点重跑，
+            # 保证失败重试不跳过尚未合并进 combined_transcript 的片段。
+            restorable_chunk_index = self.async_base_chunk_index
 
         return {
             "file_path": self.file_path,  # 添加 file_path 到状态中
             "temp_chunks": self.temp_chunks,
             "owned_temp_chunks": self.owned_temp_chunks,
             "combined_transcript": self.combined_transcript,
-            "current_chunk_index": self.current_chunk_index,
+            "current_chunk_index": restorable_chunk_index,
             "total_chunks": self.total_chunks,
             "time_offset": self.time_offset,
             "original_file_path": self.original_file_path,
@@ -262,6 +270,7 @@ class Worker(QObject):
         self.log_message.emit("-" * 20)
         self.log_message.emit(f"启用异步处理模式，并发处理 {self.total_chunks} 个片段...")
         self.chunk_progress.emit(-1, "async_start", f"异步处理 {self.total_chunks} 个片段")
+        self.async_base_chunk_index = 0
 
         # 创建异步处理器
         self.async_processor = AsyncChunkProcessor(
@@ -286,7 +295,8 @@ class Worker(QObject):
             language_code=self.language_code,
             tag_audio_events=self.tag_audio_events,
             ffmpeg_available=self.ffmpeg_available,
-            log_callback=lambda msg: self.log_message.emit(msg)
+            log_callback=lambda msg: self.log_message.emit(msg),
+            chunk_indices=list(range(self.total_chunks))
         )
 
         if not success:
@@ -332,6 +342,8 @@ class Worker(QObject):
         self.log_message.emit("-" * 20)
         self.log_message.emit(f"恢复模式：异步处理剩余 {len(remaining_chunks)} 个片段...")
         self.chunk_progress.emit(-1, "async_restore", f"恢复异步处理 {len(remaining_chunks)} 个片段")
+        self.async_base_chunk_index = self.current_chunk_index
+        remaining_indices = list(range(self.current_chunk_index, self.total_chunks))
 
         # 创建异步处理器
         self.async_processor = AsyncChunkProcessor(
@@ -356,7 +368,8 @@ class Worker(QObject):
             language_code=self.language_code,
             tag_audio_events=self.tag_audio_events,
             ffmpeg_available=self.ffmpeg_available,
-            log_callback=lambda msg: self.log_message.emit(msg)
+            log_callback=lambda msg: self.log_message.emit(msg),
+            chunk_indices=remaining_indices
         )
 
         if not success:
@@ -365,7 +378,8 @@ class Worker(QObject):
     def _process_single_file(self, file_path: str):
         """为单个文件准备并开始上传任务。"""
         self.uploader = self.client.prepare_upload_task(
-            file_path, self.language_code, self.tag_audio_events
+            file_path, self.language_code, self.tag_audio_events,
+            max_retries=self.max_retries
         )
         if not self.uploader:
             self.error.emit(f"为文件 {os.path.basename(file_path)} 准备任务失败。")
@@ -408,9 +422,21 @@ class Worker(QObject):
         """异步处理失败回调"""
         self.log_message.emit(f"异步处理失败: {error_message}")
 
+        if self._is_cancelled:
+            if not self._cancellation_reported:
+                self._cancellation_reported = True
+                self.error.emit("用户取消了任务")
+            return
+
         # 检查是否可以降级到顺序处理
         if self.async_processor:
             progress_info = self.async_processor.get_progress_info()
+            if progress_info.get("is_cancelled"):
+                if not self._cancellation_reported:
+                    self._cancellation_reported = True
+                    self.error.emit("用户取消了任务")
+                return
+
             completed_count = progress_info.get("completed_chunks", 0)
 
             if completed_count > 0:
@@ -426,6 +452,9 @@ class Worker(QObject):
     def _fallback_to_sequential_processing(self):
         """降级到顺序处理模式"""
         try:
+            if self._is_cancelled:
+                return
+
             self.log_message.emit("正在降级到顺序处理模式...")
 
             # 禁用异步处理
@@ -434,28 +463,29 @@ class Worker(QObject):
             # 获取已完成的片段信息
             if self.async_processor:
                 completed_chunks = self.async_processor.completed_chunks
+                base_index = self.async_base_chunk_index
 
-                # 合并已完成的片段结果
-                if completed_chunks:
-                    self.log_message.emit(f"合并已完成的 {len(completed_chunks)} 个片段结果...")
+                # 只复用从 base_index 开始的连续成功前缀。
+                # 如果中间片段失败，后面的成功片段会在顺序模式中重跑，避免字幕缺段。
+                reusable_indices = []
+                next_index = base_index
+                while next_index < self.total_chunks and next_index in completed_chunks:
+                    reusable_indices.append(next_index)
+                    next_index += 1
 
-                    # 按顺序合并已完成的片段（时间偏移已在异步处理器中处理）
-                    for chunk_index in sorted(completed_chunks.keys()):
-                        transcript_json = completed_chunks[chunk_index]
+                if reusable_indices:
+                    self.log_message.emit(
+                        f"复用连续完成的 {len(reusable_indices)} 个片段，"
+                        f"将从第 {next_index + 1} 个片段顺序补处理..."
+                    )
+                    for chunk_index in reusable_indices:
+                        self._append_transcript(completed_chunks[chunk_index])
+                else:
+                    self.log_message.emit(
+                        f"没有可安全复用的连续片段，将从第 {base_index + 1} 个片段顺序补处理..."
+                    )
 
-                        if not self.combined_transcript:
-                            # 第一个片段作为模板
-                            self.combined_transcript = transcript_json.copy()
-                        else:
-                            # 后续片段直接追加（时间偏移已经在异步处理器中处理过）
-                            words = transcript_json.get("words", [])
-                            self.combined_transcript["words"].extend(words)
-                            if self.combined_transcript["text"]:
-                                self.combined_transcript["text"] += " "
-                            self.combined_transcript["text"] += transcript_json.get("text", "")
-
-                    # 更新当前处理索引
-                    self.current_chunk_index = max(completed_chunks.keys()) + 1
+                self.current_chunk_index = next_index
 
                 # 清理异步处理器
                 self.async_processor = None
@@ -471,6 +501,28 @@ class Worker(QObject):
         except Exception as e:
             self.error.emit(f"降级处理失败: {e}")
 
+    def _append_transcript(self, transcript_json: dict):
+        """按顺序追加一个已经带全局时间偏移的转录结果。"""
+        if not transcript_json:
+            return
+
+        if not self.combined_transcript:
+            self.combined_transcript = transcript_json.copy()
+            if "words" in self.combined_transcript:
+                self.combined_transcript["words"] = list(self.combined_transcript.get("words", []))
+            return
+
+        words = transcript_json.get("words", [])
+        self.combined_transcript.setdefault("words", [])
+        self.combined_transcript["words"].extend(words)
+
+        text = transcript_json.get("text", "")
+        self.combined_transcript.setdefault("text", "")
+        if text:
+            if self.combined_transcript["text"]:
+                self.combined_transcript["text"] += " "
+            self.combined_transcript["text"] += text
+
     def _on_async_progress_updated(self, chunk_index: int, bytes_sent: int, total_bytes: int):
         """异步处理进度更新回调"""
         # 转发进度信号到主窗口
@@ -482,17 +534,13 @@ class Worker(QObject):
     # === 恢复模式的异步处理回调方法 ===
     def _on_async_chunk_started_restored(self, chunk_index: int):
         """恢复模式：异步片段开始处理回调"""
-        # 调整索引以反映实际的全局片段位置
-        actual_chunk_index = self.current_chunk_index + chunk_index
-        self.log_message.emit(f"恢复模式：开始异步处理片段 {actual_chunk_index + 1}/{self.total_chunks}")
-        self.chunk_progress.emit(actual_chunk_index, "started", f"恢复处理片段 {actual_chunk_index + 1}/{self.total_chunks}")
+        self.log_message.emit(f"恢复模式：开始异步处理片段 {chunk_index + 1}/{self.total_chunks}")
+        self.chunk_progress.emit(chunk_index, "started", f"恢复处理片段 {chunk_index + 1}/{self.total_chunks}")
 
     def _on_async_chunk_completed_restored(self, chunk_index: int, transcript_json: dict):
         """恢复模式：异步片段完成回调"""
-        # 调整索引以反映实际的全局片段位置
-        actual_chunk_index = self.current_chunk_index + chunk_index
-        self.log_message.emit(f"恢复模式：片段 {actual_chunk_index + 1}/{self.total_chunks} 异步转录成功")
-        self.chunk_progress.emit(actual_chunk_index, "completed", f"恢复片段 {actual_chunk_index + 1}/{self.total_chunks} 转录完成")
+        self.log_message.emit(f"恢复模式：片段 {chunk_index + 1}/{self.total_chunks} 异步转录成功")
+        self.chunk_progress.emit(chunk_index, "completed", f"恢复片段 {chunk_index + 1}/{self.total_chunks} 转录完成")
         # transcript_json 在这里不需要特殊处理，由异步处理器自动合并
 
     def _on_async_all_completed_restored(self, remaining_transcript: dict):

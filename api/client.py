@@ -1,6 +1,7 @@
 import os
 import random
 import ipaddress
+import time
 from typing import Optional, Any, Dict
 
 import requests
@@ -61,47 +62,72 @@ class UploaderSignals(QObject):
 
 class Uploader(QRunnable):
     """Runnable that handles the blocking network request."""
-    def __init__(self, file_path: str, payload: Dict, headers: Dict):
+    def __init__(self, file_path: str, payload: Dict, headers: Dict, max_retries: int = 1):
         super().__init__()
         self.signals = UploaderSignals()
         self.file_path = file_path
         self.payload = payload
         self.headers = headers
+        self.max_retries = max(1, max_retries)
         self.session = requests.Session()
         self._is_cancelled = False
 
+    def execute(self) -> Dict:
+        """Runs the blocking upload in the current thread and returns the transcript JSON."""
+        if self._is_cancelled:
+            raise IOError("Upload cancelled by user.")
+
+        with open(self.file_path, 'rb') as f_audio:
+            self.payload['file'] = (os.path.basename(self.file_path), f_audio, self.payload['file'][2])
+
+            encoder = MultipartEncoder(fields=self.payload)
+            monitor = MultipartEncoderMonitor(encoder, self.progress_callback)
+
+            self.headers['Content-Type'] = monitor.content_type
+
+            response = self.session.post(
+                ELEVENLABS_STT_API_URL,
+                params=ELEVENLABS_STT_PARAMS,
+                headers=self.headers,
+                data=monitor,
+                timeout=1800
+            )
+            response.raise_for_status()
+            return response.json()
+
     def run(self):
         """The main work of the uploader thread."""
-        try:
-            # *** BUG FIX: Open the file within the thread that uses it ***
-            with open(self.file_path, 'rb') as f_audio:
-                # Update payload with the file object
-                self.payload['file'] = (os.path.basename(self.file_path), f_audio, self.payload['file'][2])
+        last_error = None
 
-                encoder = MultipartEncoder(fields=self.payload)
-                monitor = MultipartEncoderMonitor(encoder, self.progress_callback)
+        for attempt in range(self.max_retries):
+            if self._is_cancelled:
+                return
 
-                self.headers['Content-Type'] = monitor.content_type
+            try:
+                self.signals.finished.emit(self.execute())
+                return
+            except Exception as e:
+                last_error = e
+                if self._is_cancelled:
+                    return
+                if attempt < self.max_retries - 1:
+                    self._sleep_before_retry(2 ** attempt)
 
-                response = self.session.post(
-                    ELEVENLABS_STT_API_URL,
-                    params=ELEVENLABS_STT_PARAMS,
-                    headers=self.headers,
-                    data=monitor,
-                    timeout=1800
-                )
-                response.raise_for_status()
-                self.signals.finished.emit(response.json())
-
-        except Exception as e:
-            if not self._is_cancelled:
-                self.signals.error.emit(f"上传或转录失败: {e}")
+        if not self._is_cancelled:
+            self.signals.error.emit(f"上传或转录失败: {last_error}")
 
     def progress_callback(self, monitor):
         if self._is_cancelled:
             # This will cause the session.post() to raise an exception.
             raise IOError("Upload cancelled by user.")
         self.signals.progress.emit(monitor.bytes_read, monitor.len)
+
+    def _sleep_before_retry(self, seconds: int):
+        remaining = float(seconds)
+        while remaining > 0 and not self._is_cancelled:
+            interval = min(0.2, remaining)
+            time.sleep(interval)
+            remaining -= interval
         
     def cancel(self):
         """Cancels the upload."""
@@ -142,7 +168,8 @@ class ElevenLabsSTTClient:
             self._log(f"  获取文件信息时出错: {e}")
             return None
 
-    def prepare_upload_task(self, file_path: str, language_code: str, tag_audio_events: bool) -> Optional[Uploader]:
+    def prepare_upload_task(self, file_path: str, language_code: str, tag_audio_events: bool,
+                            max_retries: int = 1) -> Optional[Uploader]:
         """Prepares an Uploader runnable task without starting it."""
         if not os.path.exists(file_path):
             self._log(f"错误：文件 '{file_path}' 未找到。")
@@ -181,4 +208,4 @@ class ElevenLabsSTTClient:
         }
         headers.update(forward_headers)
         
-        return Uploader(file_path, payload, headers)
+        return Uploader(file_path, payload, headers, max_retries=max_retries)

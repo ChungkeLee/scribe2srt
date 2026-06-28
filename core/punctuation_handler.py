@@ -40,9 +40,19 @@ class PunctuationHandler:
         # 东亚语系短语分隔符，包含引用开始符、省略号和连字符
         "，", "、", "《", "「", "【", "（"
     }
+
+    # 句尾标点后常见的闭合符号。识别分割点时应透过这些符号检查前一个字符。
+    TRAILING_CLOSERS = {
+        '"', "'", "”", "’", "」", "』", "》", "）", ")", "]", "}", "】"
+    }
     
     # 所有标点符号的并集
-    ALL_PUNCTUATION = HIGH_PRIORITY_PUNCTUATION | MEDIUM_PRIORITY_PUNCTUATION | LOW_PRIORITY_PUNCTUATION
+    ALL_PUNCTUATION = (
+        HIGH_PRIORITY_PUNCTUATION |
+        MEDIUM_PRIORITY_PUNCTUATION |
+        LOW_PRIORITY_PUNCTUATION |
+        TRAILING_CLOSERS
+    )
     
     # 用于文本分割的字符（包含空格）
     SPLIT_CHARACTERS = " " + "".join(ALL_PUNCTUATION)
@@ -125,7 +135,11 @@ class PunctuationHandler:
         if not text:
             return False, "", -1
         
-        last_char = text[-1]
+        check_index = len(text) - 1
+        while check_index > 0 and text[check_index] in cls.TRAILING_CLOSERS:
+            check_index -= 1
+
+        last_char = text[check_index]
         priority = cls.get_punctuation_priority(last_char)
         
         if priority >= 0:
@@ -162,8 +176,9 @@ class PunctuationHandler:
                     break
                 # 对于标点符号，在标点符号后分割
                 else:
-                    best_pos = i + 1
-                    break
+                    if i + 1 <= max_length:
+                        best_pos = i + 1
+                        break
         
         # 如果没找到合适的分割点，强制在最大长度处分割
         if best_pos <= 0:

@@ -214,12 +214,18 @@ class MainWindow(QMainWindow):
             "max_retries": 3,
             "api_rate_limit_per_minute": 30,
         }
+        self.supported_settings_keys = set(self.settings.keys())
 
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                     loaded_settings = json.load(f)
-                    self.settings.update(loaded_settings)
+                    supported_settings = {
+                        key: value
+                        for key, value in loaded_settings.items()
+                        if key in self.supported_settings_keys
+                    }
+                    self.settings.update(supported_settings)
             except (json.JSONDecodeError, TypeError):
                 print(f"警告: 无法解析 {SETTINGS_FILE}。将使用默认设置。")
 
@@ -229,8 +235,13 @@ class MainWindow(QMainWindow):
 
     def save_settings(self):
         """保存当前设置到文件。"""
+        settings_to_save = {
+            key: self.settings[key]
+            for key in self.supported_settings_keys
+            if key in self.settings
+        }
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.settings, f, indent=4)
+            json.dump(settings_to_save, f, indent=4)
 
     def open_settings_dialog(self):
         """打开设置对话框并处理结果。"""

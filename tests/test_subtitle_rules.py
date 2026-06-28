@@ -10,13 +10,17 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except AttributeError:
+    pass
 
 try:
     from .optimize_based_on_analysis import EnhancedSubtitleAnalyzer
 except ImportError:
     from optimize_based_on_analysis import EnhancedSubtitleAnalyzer
 
-def test_single_file(srt_path: str):
+def analyze_single_file(srt_path: str):
     """测试单个SRT文件"""
     if not os.path.exists(srt_path):
         print(f"文件不存在: {srt_path}")
@@ -104,7 +108,7 @@ def test_single_file(srt_path: str):
             if len(violation_list) > 5:
                 print(f"  ... 还有 {len(violation_list) - 5} 个类似问题")
 
-def test_directory(directory: str):
+def analyze_directory(directory: str):
     """测试目录中的所有SRT文件"""
     analyzer = EnhancedSubtitleAnalyzer()
     result = analyzer.analyze_directory_rules(directory)
@@ -114,7 +118,8 @@ def test_directory(directory: str):
         return
     
     analyzer.print_rules_analysis_report(result)
-    analyzer.generate_improvement_suggestions(result)
+    if hasattr(analyzer, 'generate_improvement_suggestions'):
+        analyzer.generate_improvement_suggestions(result)
 
 def main():
     """主函数"""
@@ -133,9 +138,9 @@ def main():
     
     # 自动检测文件类型
     if args.file or (not args.dir and os.path.isfile(args.path)):
-        test_single_file(args.path)
+        analyze_single_file(args.path)
     elif args.dir or os.path.isdir(args.path):
-        test_directory(args.path)
+        analyze_directory(args.path)
     else:
         print("无法确定路径类型，请使用 --file 或 --dir 参数")
 
@@ -143,6 +148,6 @@ if __name__ == "__main__":
     # 如果没有命令行参数，默认测试sample目录
     if len(sys.argv) == 1:
         print("使用默认参数测试 sample 目录...")
-        test_directory("sample")
+        analyze_directory("sample")
     else:
         main()

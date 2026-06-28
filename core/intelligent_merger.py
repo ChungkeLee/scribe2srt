@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple
 import re
 from .config import MIN_SUBTITLE_DURATION, MIN_SUBTITLE_GAP, CPS_SETTINGS, CPL_SETTINGS
 from .punctuation_handler import PunctuationHandler
+from .language_utils import is_cjk_language
 
 
 class IntelligentMerger:
@@ -25,7 +26,7 @@ class IntelligentMerger:
     
     def __init__(self, language_code: str = "eng", subtitle_settings: Dict = None):
         self.language = language_code[:3]
-        self.is_cjk = self._is_cjk_language()
+        self.is_cjk = is_cjk_language(self.language)
         
         # 初始化规则参数
         if subtitle_settings:
@@ -51,10 +52,6 @@ class IntelligentMerger:
             else:
                 self.max_cps = CPS_SETTINGS["latin"]
                 self.max_chars_per_line = CPL_SETTINGS["latin"]
-    
-    def _is_cjk_language(self) -> bool:
-        """检查是否为CJK语言"""
-        return self.language in ["zho", "jpn", "kor", "chi", "zh", "ja", "ko"]
     
     def _calculate_cps(self, text: str, duration: float) -> float:
         """计算CPS（每秒字符数）"""
@@ -113,7 +110,13 @@ class IntelligentMerger:
         # 如果间隔太大，不适合合并
         if gap > 2.0:  # 间隔超过2秒不合并
             return False, f"时间间隔过大: {gap:.3f}s > 2.0s"
-        
+
+        # 已经完整结束的句子不主动跨句合并，避免后续为了约束在非语义位置拆开。
+        entry1_duration = entry1['end'] - entry1['start']
+        has_sentence_end, _, priority = PunctuationHandler.word_ends_with_punctuation(entry1.get('text', ''))
+        if has_sentence_end and priority == 0 and entry1_duration >= self.min_subtitle_duration:
+            return False, "前一条已是完整句子"
+
         # 计算合并后的属性
         merged_text = entry1['text'] + ' ' + entry2['text']  # 添加空格分隔
         merged_start = entry1['start']

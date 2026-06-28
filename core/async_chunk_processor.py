@@ -9,7 +9,7 @@ import os
 import json
 import time
 from typing import List, Dict, Any, Optional, Callable
-from PySide6.QtCore import QObject, Signal, QMutex, QMutexLocker, QSemaphore, QRunnable, QEventLoop, QTimer
+from PySide6.QtCore import QObject, Signal, QMutex, QMutexLocker, QSemaphore, QRunnable
 
 from api.client import ElevenLabsSTTClient
 
@@ -95,7 +95,7 @@ class ChunkProcessorTask(QRunnable):
                     last_error = e
                     if attempt < self.max_retries - 1:
                         wait_time = 2 ** attempt  # 指数退避
-                        time.sleep(wait_time)
+                        self._sleep_before_retry(wait_time)
 
             # 所有重试都失败
             raise last_error or Exception("未知错误")
@@ -111,44 +111,22 @@ class ChunkProcessorTask(QRunnable):
 
     def _execute_upload_sync(self, uploader) -> dict:
         """同步执行上传任务"""
+        if not self.parent_processor.register_uploader(uploader):
+            raise Exception("任务被取消")
 
-        result = {}
-        error = {}
-        loop = QEventLoop()
+        try:
+            return uploader.execute()
+        finally:
+            self.parent_processor.unregister_uploader(uploader)
 
-        def on_finished(transcript_json):
-            result['data'] = transcript_json
-            loop.quit()
-
-        def on_error(error_message):
-            error['message'] = error_message
-            loop.quit()
-
-        # 连接信号
-        uploader.signals.finished.connect(on_finished)
-        uploader.signals.error.connect(on_error)
-
-        # 设置超时定时器
-        timeout_timer = QTimer()
-        timeout_timer.setSingleShot(True)
-        timeout_timer.timeout.connect(loop.quit)
-        timeout_timer.start(1800000)  # 30分钟超时
-
-        # 启动上传
-        from PySide6.QtCore import QThreadPool
-        QThreadPool.globalInstance().start(uploader)
-
-        # 等待完成
-        loop.exec()
-
-        timeout_timer.stop()
-
-        if 'data' in result:
-            return result['data']
-        elif 'message' in error:
-            raise Exception(error['message'])
-        else:
-            raise Exception("上传超时或被取消")
+    def _sleep_before_retry(self, seconds: int):
+        slept = 0.0
+        while slept < seconds:
+            if self.parent_processor.is_cancelled:
+                raise Exception("任务被取消")
+            interval = min(0.2, seconds - slept)
+            time.sleep(interval)
+            slept += interval
 
     def _save_chunk_json(self, transcript_json: dict):
         """保存分段JSON文件"""
@@ -181,6 +159,7 @@ class AsyncChunkProcessor(QObject):
         self.completed_chunks: Dict[int, dict] = {}
         self.failed_chunks: Dict[int, str] = {}
         self.processing_chunks: set = set()
+        self.active_uploaders: set = set()
         self.total_chunks = 0
         self.is_cancelled = False
 
@@ -197,7 +176,8 @@ class AsyncChunkProcessor(QObject):
                            language_code: str,
                            tag_audio_events: bool,
                            ffmpeg_available: bool,
-                           log_callback: Optional[Callable[[str], None]] = None) -> bool:
+                           log_callback: Optional[Callable[[str], None]] = None,
+                           chunk_indices: Optional[List[int]] = None) -> bool:
         """
         异步处理所有音频片段
 
@@ -208,6 +188,7 @@ class AsyncChunkProcessor(QObject):
             tag_audio_events: 是否标记音频事件
             ffmpeg_available: FFmpeg是否可用
             log_callback: 日志回调函数
+            chunk_indices: 每个片段对应的全局片段索引。恢复任务时用于保持时间轴偏移正确。
 
         Returns:
             bool: 是否成功启动处理
@@ -215,10 +196,19 @@ class AsyncChunkProcessor(QObject):
         if not chunk_paths:
             return False
 
+        if chunk_indices is None:
+            chunk_indices = list(range(len(chunk_paths)))
+
+        if len(chunk_indices) != len(chunk_paths):
+            if log_callback:
+                log_callback("启动异步处理失败: chunk_indices 与 chunk_paths 数量不一致")
+            return False
+
         self.total_chunks = len(chunk_paths)
         self.completed_chunks.clear()
         self.failed_chunks.clear()
         self.processing_chunks.clear()
+        self.active_uploaders.clear()
         self.is_cancelled = False
 
         if log_callback:
@@ -226,23 +216,25 @@ class AsyncChunkProcessor(QObject):
 
         # 预计算时间偏移
         time_offsets = {
-            i: i * split_duration_sec
-            for i in range(self.total_chunks)
+            chunk_index: chunk_index * split_duration_sec
+            for chunk_index in chunk_indices
         }
 
         # 使用Qt的线程池而不是Python的ThreadPoolExecutor
         # 这样可以更好地与Qt信号系统集成
         try:
             # 启动所有片段的处理任务
-            for i, chunk_path in enumerate(chunk_paths):
+            for local_i, chunk_path in enumerate(chunk_paths):
                 if self.is_cancelled:
                     break
 
+                global_chunk_index = chunk_indices[local_i]
+
                 # 创建处理任务
                 processor = ChunkProcessorTask(
-                    chunk_index=i,
+                    chunk_index=global_chunk_index,
                     chunk_path=chunk_path,
-                    time_offset=time_offsets[i],
+                    time_offset=time_offsets[global_chunk_index],
                     language_code=language_code,
                     tag_audio_events=tag_audio_events,
                     ffmpeg_available=ffmpeg_available,
@@ -254,7 +246,7 @@ class AsyncChunkProcessor(QObject):
                 processor.signals.chunk_completed.connect(self._on_chunk_completed)
                 processor.signals.chunk_failed.connect(self._on_chunk_failed)
                 processor.signals.progress_updated.connect(
-                    lambda sent, total, chunk_idx=i:
+                    lambda sent, total, chunk_idx=global_chunk_index:
                     self.progress_updated.emit(chunk_idx, sent, total)
                 )
 
@@ -263,7 +255,7 @@ class AsyncChunkProcessor(QObject):
                 QThreadPool.globalInstance().start(processor)
 
                 # 发送开始信号
-                self.chunk_started.emit(i)
+                self.chunk_started.emit(global_chunk_index)
 
             return True
 
@@ -276,24 +268,46 @@ class AsyncChunkProcessor(QObject):
 
     def _wait_for_rate_limit(self):
         """等待速率限制"""
-        with QMutexLocker(self.mutex):
-            now = time.time()
+        while True:
+            wait_time = 0.0
+            with QMutexLocker(self.mutex):
+                now = time.time()
 
-            # 清理超过1分钟的请求记录
-            self.request_times = [
-                t for t in self.request_times
-                if now - t < 60
-            ]
+                # 清理超过1分钟的请求记录
+                self.request_times = [
+                    t for t in self.request_times
+                    if now - t < 60
+                ]
 
-            # 检查是否需要等待
-            if len(self.request_times) >= self.max_requests_per_minute:
+                if len(self.request_times) < self.max_requests_per_minute:
+                    self.request_times.append(now)
+                    return
+
                 oldest_request = min(self.request_times)
-                wait_time = 60 - (now - oldest_request)
-                if wait_time > 0:
-                    time.sleep(wait_time)
+                wait_time = max(0.0, 60 - (now - oldest_request))
 
-            # 记录新请求
-            self.request_times.append(now)
+            slept = 0.0
+            while slept < wait_time:
+                with QMutexLocker(self.mutex):
+                    if self.is_cancelled:
+                        return
+                interval = min(0.2, wait_time - slept)
+                time.sleep(interval)
+                slept += interval
+
+    def register_uploader(self, uploader) -> bool:
+        """Register an active uploader so cancellation can interrupt it."""
+        with QMutexLocker(self.mutex):
+            if self.is_cancelled:
+                uploader.cancel()
+                return False
+            self.active_uploaders.add(uploader)
+            return True
+
+    def unregister_uploader(self, uploader):
+        """Remove an uploader from the active cancellation set."""
+        with QMutexLocker(self.mutex):
+            self.active_uploaders.discard(uploader)
 
     def _on_chunk_completed(self, chunk_index: int, transcript_json: dict):
         """片段完成回调"""
@@ -371,8 +385,14 @@ class AsyncChunkProcessor(QObject):
         """取消所有处理"""
         with QMutexLocker(self.mutex):
             self.is_cancelled = True
-            # 发送取消信号，让正在等待的任务能够及时退出
-            self.processing_failed.emit("用户取消了任务")
+            active_uploaders = list(self.active_uploaders)
+            self.active_uploaders.clear()
+
+        for uploader in active_uploaders:
+            uploader.cancel()
+
+        # 发送取消信号，让正在等待的任务能够及时退出
+        self.processing_failed.emit("用户取消了任务")
 
     def get_progress_info(self) -> Dict[str, Any]:
         """获取处理进度信息"""

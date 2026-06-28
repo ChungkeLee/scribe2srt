@@ -8,6 +8,7 @@
 
 from typing import Dict, List, Tuple
 from .punctuation_handler import PunctuationHandler
+from .language_utils import is_cjk_language
 
 
 class SentenceSplitter:
@@ -23,13 +24,7 @@ class SentenceSplitter:
     
     def __init__(self, language_code: str = "eng"):
         self.language = language_code[:3]
-        self.is_cjk = self._is_cjk_language()
-
-
-    
-    def _is_cjk_language(self) -> bool:
-        """检查是否为CJK语言"""
-        return self.language in ["zho", "jpn", "kor", "chi", "zh", "ja", "ko"]
+        self.is_cjk = is_cjk_language(self.language)
     
 
     

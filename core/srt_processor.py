@@ -6,6 +6,7 @@ SRT字幕处理器模块
 使用新的两阶段算法：基于标点符号的句子预分割 + 智能合并
 """
 
+import math
 import re
 from typing import Dict, List
 
@@ -15,6 +16,7 @@ from .config import (
 from .sentence_splitter import SentenceSplitter
 from .intelligent_merger import IntelligentMerger
 from .punctuation_handler import PunctuationHandler
+from .language_utils import is_cjk_language
 
 
 def format_srt_time(seconds: float) -> str:
@@ -42,7 +44,7 @@ class SrtProcessor:
         self.srt_content = []
         self.line_number = 1
         self.language = json_data.get("language_code", "eng")[:3] # e.g., "eng"
-        self.is_cjk = self._is_cjk_language()
+        self.is_cjk = is_cjk_language(self.language)
 
         # 如果提供了高级设置，使用它们；否则使用默认值
         if subtitle_settings:
@@ -69,10 +71,6 @@ class SrtProcessor:
 
         self._preprocess_words(json_data)
 
-    def _is_cjk_language(self) -> bool:
-        """Check if the language is CJK (Chinese, Japanese, Korean)."""
-        return self.language in ["zho", "jpn", "kor", "chi", "zh", "ja", "ko"]
-
     def _get_max_chars_for_language(self) -> int:
         """Returns the recommended max characters per line based on language."""
         if self.is_cjk:
@@ -89,27 +87,15 @@ class SrtProcessor:
 
     def _get_dynamic_cps_limit(self, text: str) -> float:
         """
-        根据文本长度动态调整CPS限制
+        返回当前语言的CPS硬限制。
 
         Args:
             text: 文本内容
 
         Returns:
-            动态调整后的CPS限制
+            当前语言的CPS限制
         """
-        import re
-        base_cps = self.max_cps
-        text_length = len(re.sub(r'\s+', '', text))  # 去除空白字符的长度
-
-        # 对于极短文本，允许更高的CPS
-        if text_length <= 3:
-            return base_cps * 3.0  # 极短文本（如"啊"）允许3倍CPS
-        elif text_length <= 5:
-            return base_cps * 2.0  # 短文本允许2倍CPS
-        elif text_length <= 10:
-            return base_cps * 1.5  # 中短文本允许1.5倍CPS
-        else:
-            return base_cps
+        return self.max_cps
 
     def _preprocess_words(self, json_data: Dict):
         """
@@ -215,6 +201,9 @@ class SrtProcessor:
         # Stage 4: Combine and sort all entries (word-based + audio events)
         all_entries = merged_entries + audio_event_entries
         all_entries.sort(key=lambda x: x['start'])  # 按时间顺序排序
+        all_entries = [self._apply_terminal_punctuation(entry) for entry in all_entries]
+        all_entries = self._split_entries_by_constraints(all_entries)
+        all_entries = [self._apply_terminal_punctuation(entry) for entry in all_entries]
         all_entries = self._normalize_timeline(all_entries)
 
         # Stage 5: Generate final SRT content with optimized display formatting
@@ -233,7 +222,7 @@ class SrtProcessor:
 
         words = [word for word in entry.get('words', []) if word.get('type') == 'word']
         if len(words) <= 1 or depth >= 12:
-            return [self._build_entry_from_words(words, entry) if words else entry]
+            return self._split_single_word_entry(entry) if words else [entry]
 
         split_index = self._find_best_word_split(words)
         if split_index is None:
@@ -252,8 +241,12 @@ class SrtProcessor:
         if not text:
             return True
 
-        duration = entry.get('end', 0) - entry.get('start', 0)
+        start, end = self._entry_time_bounds(entry)
+        duration = end - start
         if duration <= 0 or duration > self.max_subtitle_duration:
+            return False
+
+        if self._required_duration_for_cps(text) > self.max_subtitle_duration:
             return False
 
         display_lines = self._wrap_text_unlimited(text)
@@ -263,6 +256,111 @@ class SrtProcessor:
             return False
 
         return True
+
+    def _split_single_word_entry(self, entry: Dict) -> List[Dict]:
+        """Split a long single timed token/phrase proportionally by text."""
+        words = [word for word in entry.get('words', []) if word.get('type') == 'word']
+        if not words:
+            return [entry]
+
+        text = entry.get('text', '').strip()
+        if not text:
+            return [entry]
+
+        start, end = self._entry_time_bounds(entry)
+        duration = max(0.001, end - start)
+        max_chars_per_subtitle = max(1, self.max_chars_per_line * 2)
+        readable_chars = max(1, self._count_readable_chars(text))
+
+        part_count = max(
+            1,
+            math.ceil(duration / self.max_subtitle_duration),
+            math.ceil(readable_chars / max_chars_per_subtitle)
+        )
+
+        if part_count <= 1:
+            return [self._build_entry_from_words(words, entry)]
+
+        pieces = self._split_text_into_balanced_pieces(text, part_count)
+        if len(pieces) <= 1:
+            pieces = [text]
+
+        display_duration = min(duration, len(pieces) * self.max_subtitle_duration)
+        piece_duration = max(0.001, display_duration / len(pieces))
+        cursor = start
+        split_entries = []
+
+        for index, piece in enumerate(pieces):
+            if index == len(pieces) - 1 and display_duration >= duration:
+                piece_end = end
+            else:
+                piece_end = min(end, cursor + piece_duration)
+
+            source_word = words[0].copy()
+            source_word['text'] = piece
+            source_word['start'] = round(cursor, 3)
+            source_word['end'] = round(piece_end, 3)
+
+            split_entries.append({
+                'text': piece,
+                'start': source_word['start'],
+                'end': source_word['end'],
+                'words': [source_word],
+                'is_audio_event': entry.get('is_audio_event', False),
+                'word_count': 1,
+                'char_count': self._count_readable_chars(piece)
+            })
+            cursor = piece_end
+
+        return split_entries
+
+    def _split_text_into_balanced_pieces(self, text: str, part_count: int) -> List[str]:
+        remaining = text.strip()
+        pieces = []
+
+        for index in range(part_count - 1):
+            remaining_parts = part_count - index
+            target_length = max(1, math.ceil(len(remaining) / remaining_parts))
+            split_pos = self._find_balanced_text_split(remaining, target_length)
+
+            piece = remaining[:split_pos].strip()
+            if piece:
+                self._append_text_piece(pieces, piece)
+            remaining = remaining[split_pos:].strip()
+
+            if not remaining:
+                break
+
+        if remaining:
+            self._append_text_piece(pieces, remaining)
+
+        return pieces
+
+    def _find_balanced_text_split(self, text: str, target_length: int) -> int:
+        if len(text) <= 1:
+            return len(text)
+
+        fallback = min(max(1, target_length), len(text) - 1)
+        min_pos = max(1, int(target_length * 0.65))
+        max_pos = min(len(text) - 1, max(min_pos, int(target_length * 1.35)))
+
+        for pos in range(max_pos, min_pos - 1, -1):
+            prev_char = text[pos - 1]
+            current_char = text[pos] if pos < len(text) else ""
+            if prev_char in PunctuationHandler.ALL_PUNCTUATION:
+                return pos
+            if current_char == " ":
+                return pos
+
+        return fallback
+
+    def _append_text_piece(self, pieces: List[str], piece: str):
+        if not piece:
+            return
+        if pieces and all(char in PunctuationHandler.ALL_PUNCTUATION for char in piece):
+            pieces[-1] += piece
+            return
+        pieces.append(piece)
 
     def _build_entry_from_words(self, words: List[Dict], template: Dict = None) -> Dict:
         template = template or {}
@@ -310,7 +408,7 @@ class SrtProcessor:
             previous_text = left_words[-1].get('text', '').strip()
             has_punct, _, priority = PunctuationHandler.word_ends_with_punctuation(previous_text)
             if has_punct:
-                score -= {0: 8, 1: 5, 2: 2}.get(priority, 0)
+                score -= {0: 60, 1: 35, 2: 15}.get(priority, 0)
 
             gap = right_words[0].get('start', left_words[-1].get('end', 0)) - left_words[-1].get('end', 0)
             if gap > 0:
@@ -332,52 +430,65 @@ class SrtProcessor:
 
     def _constraint_penalty(self, text: str, words: List[Dict]) -> float:
         duration = words[-1].get('end', 0) - words[0].get('start', 0)
+        effective_duration = max(duration, self.min_subtitle_duration)
         lines = self._wrap_text_unlimited(text)
         penalty = max(0, len(lines) - 2) * 8
         penalty += sum(max(0, len(line) - self.max_chars_per_line) for line in lines) / 5
 
-        cps = self._calculate_cps(text, duration)
+        cps = self._calculate_cps(text, effective_duration)
         cps_limit = self._get_dynamic_cps_limit(text)
         if cps > cps_limit:
             penalty += (cps - cps_limit) / max(cps_limit, 1)
 
+        if duration <= 0:
+            penalty += 25
+
         return penalty
 
     def _normalize_timeline(self, entries: List[Dict]) -> List[Dict]:
-        """Keep final subtitles ordered and non-overlapping before SRT serialization."""
+        """Keep final subtitles ordered while preserving their source word time range."""
         if not entries:
             return []
 
         sorted_entries = sorted((entry.copy() for entry in entries), key=lambda x: x['start'])
         normalized = []
 
-        for index, entry in enumerate(sorted_entries):
+        for entry in sorted_entries:
             current = entry.copy()
-
-            if normalized:
-                min_start = normalized[-1]['end'] + self.min_subtitle_gap
-                if current['start'] < min_start:
-                    current['start'] = min_start
-
-            original_duration = max(0.001, current['end'] - current['start'])
-            desired_duration = min(
-                self.max_subtitle_duration,
-                max(
-                    original_duration,
+            is_audio_event = current.get('is_audio_event', False)
+            source_start, source_end = self._entry_time_bounds(current)
+            coverage_duration = max(0.001, source_end - source_start)
+            if is_audio_event and coverage_duration > self.max_subtitle_duration:
+                target_duration = self.max_subtitle_duration
+            else:
+                target_duration = max(
+                    coverage_duration,
                     self.min_subtitle_duration,
                     self._required_duration_for_cps(current.get('text', ''))
                 )
-            )
-            desired_end = current['start'] + desired_duration
 
-            hard_max_end = current['start'] + self.max_subtitle_duration
-            if index + 1 < len(sorted_entries):
-                next_start = sorted_entries[index + 1]['start']
-                max_end = next_start - self.min_subtitle_gap
-                if max_end > current['start']:
-                    hard_max_end = min(hard_max_end, max_end)
+            if target_duration > self.max_subtitle_duration and coverage_duration <= self.max_subtitle_duration:
+                target_duration = self.max_subtitle_duration
 
-            current['end'] = min(max(current['end'], desired_end), hard_max_end)
+            if not is_audio_event:
+                target_duration = max(target_duration, coverage_duration)
+
+            if normalized:
+                self._trim_previous_entry_for_next_start(normalized[-1], source_start)
+                min_start = normalized[-1]['end'] + self.min_subtitle_gap
+            else:
+                min_start = 0.0
+
+            preferred_start = source_end - target_duration
+            current['start'] = max(0.0, min_start, preferred_start)
+            current['end'] = current['start'] + target_duration
+
+            if not is_audio_event and current['start'] <= source_start and current['end'] < source_end:
+                current['end'] = source_end
+
+            if not is_audio_event and current['start'] > source_start:
+                current['start'] = max(min_start, source_start)
+                current['end'] = max(current['end'], source_end)
 
             if current['end'] <= current['start']:
                 current['end'] = current['start'] + 0.001
@@ -385,6 +496,84 @@ class SrtProcessor:
             normalized.append(current)
 
         return normalized
+
+    def _trim_previous_entry_for_next_start(self, previous: Dict, next_source_start: float):
+        latest_allowed_end = next_source_start - self.min_subtitle_gap
+        if previous.get('end', 0) <= latest_allowed_end:
+            return
+
+        previous_source_start, previous_source_end = self._entry_time_bounds(previous)
+        min_required_end = previous['start'] + max(
+            previous_source_end - previous_source_start,
+            min(self.min_subtitle_duration, self.max_subtitle_duration),
+            min(self._required_duration_for_cps(previous.get('text', '')), self.max_subtitle_duration)
+        )
+        min_required_end = max(min_required_end, previous_source_end)
+
+        if latest_allowed_end >= min_required_end:
+            previous['end'] = latest_allowed_end
+
+    def _entry_time_bounds(self, entry: Dict) -> tuple:
+        timed_items = [
+            item for item in entry.get('words', [])
+            if isinstance(item.get('start'), (int, float)) and isinstance(item.get('end'), (int, float))
+        ]
+        if timed_items:
+            return (
+                min(item['start'] for item in timed_items),
+                max(item['end'] for item in timed_items)
+            )
+
+        return entry.get('start', 0), entry.get('end', 0)
+
+    def _apply_terminal_punctuation(self, entry: Dict) -> Dict:
+        normalized_entry = entry.copy()
+        normalized_entry['text'] = self._ensure_terminal_punctuation(
+            normalized_entry.get('text', '')
+        )
+        normalized_entry['char_count'] = self._count_readable_chars(normalized_entry['text'])
+        return normalized_entry
+
+    def _ensure_terminal_punctuation(self, text: str) -> str:
+        text = (text or '').strip()
+        if not text:
+            return text
+
+        if self._has_acceptable_terminal_punctuation(text):
+            return text
+
+        terminal = self._default_terminal_punctuation()
+        closers = PunctuationHandler.TRAILING_CLOSERS
+        suffix = ""
+        base = text
+
+        while base and base[-1] in closers:
+            suffix = base[-1] + suffix
+            base = base[:-1].rstrip()
+
+        if not base:
+            return text + terminal
+
+        if self._has_acceptable_terminal_punctuation(base):
+            return base + suffix
+
+        return base + terminal + suffix
+
+    def _default_terminal_punctuation(self) -> str:
+        if self.language in ["zho", "chi", "zh", "jpn", "ja"]:
+            return "。"
+        return "."
+
+    def _has_acceptable_terminal_punctuation(self, text: str) -> bool:
+        text = (text or '').strip()
+        if not text:
+            return False
+
+        unacceptable_endings = {"-", "(", "[", "{", "（", "「", "【", "《"}
+        if text[-1] in unacceptable_endings:
+            return False
+
+        return PunctuationHandler.word_ends_with_punctuation(text)[0]
 
     def _merge_short_entries(self, entries: List[Dict]) -> List[Dict]:
         if not entries:
@@ -474,7 +663,8 @@ class SrtProcessor:
         char_count = self._count_readable_chars(text)
         if char_count == 0:
             return 0.0
-        return char_count / self._get_dynamic_cps_limit(text)
+        # Add a small millisecond margin because SRT serialization rounds times.
+        return (char_count / self._get_dynamic_cps_limit(text)) + 0.005
 
     def _wrap_text_unlimited(self, text: str) -> List[str]:
         text = text.strip()

@@ -25,7 +25,7 @@ Scribe2SRT 是一款专业的音视频转字幕工具。通过集成 ElevenLabs 
 #### 安装步骤
 1. **下载项目**
    ```bash
-   git clone https://github.com/your-username/scribe2srt.git
+   git clone https://github.com/cylind/scribe2srt.git
    cd scribe2srt
    ```
 
