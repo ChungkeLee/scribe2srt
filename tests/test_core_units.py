@@ -222,6 +222,44 @@ def test_worker_offsets_first_processed_restored_chunk(tmp_path, monkeypatch):
     assert worker.combined_transcript["words"][0]["end"] == 13.3
 
 
+def test_worker_refreshes_combined_audio_duration_metadata():
+    worker = Worker(
+        file_path="placeholder.mp3",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+    worker.combined_transcript = {
+        "audio_duration_secs": 10.0,
+        "words": [
+            {"text": "first", "type": "word", "start": 0.0, "end": 1.0},
+            {"text": "last", "type": "word", "start": 42.0, "end": 43.5678},
+        ],
+    }
+
+    worker._refresh_combined_transcript_metadata()
+
+    assert worker.combined_transcript["audio_duration_secs"] == 43.568
+
+
+def test_worker_multichunk_json_cleanup_log_matches_cleanup_behavior():
+    worker = Worker(
+        file_path="placeholder.mp3",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+    worker.total_chunks = 2
+    logs = []
+    worker.log_message.connect(logs.append)
+
+    worker._cleanup_temporary_json_files()
+
+    assert logs == ["多片段处理模式：分片JSON将随临时片段清理"]
+
+
 def test_worker_smart_split_points_prefer_nearby_silence():
     worker = Worker(
         file_path="placeholder.mp3",

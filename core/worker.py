@@ -815,6 +815,19 @@ class Worker(QObject):
                 self.combined_transcript["text"] += " "
             self.combined_transcript["text"] += text
 
+    def _refresh_combined_transcript_metadata(self):
+        """Refresh final transcript metadata that can become stale after chunk merging."""
+        if not isinstance(self.combined_transcript, dict):
+            return
+
+        timed_ends = [
+            word.get("end")
+            for word in self.combined_transcript.get("words", [])
+            if isinstance(word.get("end"), (int, float))
+        ]
+        if timed_ends:
+            self.combined_transcript["audio_duration_secs"] = round(max(timed_ends), 3)
+
     def _on_async_progress_updated(self, chunk_index: int, bytes_sent: int, total_bytes: int):
         """异步处理进度更新回调"""
         # 转发进度信号到主窗口
@@ -900,6 +913,7 @@ class Worker(QObject):
         base_path, _ = os.path.splitext(self.original_file_path)
         output_json_path = base_path + ".json"
         try:
+            self._refresh_combined_transcript_metadata()
             with open(output_json_path, 'w', encoding='utf-8') as f:
                 json.dump(self.combined_transcript, f, ensure_ascii=False, indent=4)
             self.log_message.emit(f"合并后的转录文本已保存到:\n{output_json_path}")
@@ -963,8 +977,7 @@ class Worker(QObject):
             except (OSError, IndexError) as e:
                 self.log_message.emit(f"清理临时JSON文件时出错: {e}")
         else:
-            # 多片段处理模式：保留临时JSON文件用于调试
-            self.log_message.emit("多片段处理模式：保留临时JSON文件用于调试")
+            self.log_message.emit("多片段处理模式：分片JSON将随临时片段清理")
 
     def request_cancellation(self):
         """请求取消当前任务。"""
