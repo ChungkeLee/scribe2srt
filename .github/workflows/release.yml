@@ -2,6 +2,8 @@ name: Build and Release Scribe2SRT
 
 on:
   push:
+    branches: 
+     - main
     tags:
       - 'v*'
   workflow_dispatch:
