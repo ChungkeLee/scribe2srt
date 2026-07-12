@@ -131,7 +131,9 @@ class SrtProcessor:
                     prev_word['text'] += word_info['text']
                     prev_word['end'] = word_info['end']
                     continue
-            self.words.append(word_info)
+            # 存副本：后续 spacing/标点合并会就地改写文本，绝不能改到调用方传入的原始
+            # word 对象，否则同一个 JSON 二次转换会出现重复标点（不幂等）。
+            self.words.append(word_info.copy())
 
     def _create_audio_event_entries(self) -> List[Dict]:
         """
@@ -515,8 +517,23 @@ class SrtProcessor:
         if coverage_duration > self.max_subtitle_duration:
             return source_start, source_start + self.max_subtitle_duration
 
-        start = max(0.0, source_end - target_duration)
+        # 围绕真实语音区间安排显示窗口：先向前借时间（不超过 max_lead），再向后借
+        # （不超过 max_lag）。CPS 是软约束，绝不为凑够 target_duration 而让字幕提前
+        # 数秒或长时间滞留——超出上限就接受较高 CPS（同步优先于 CPS）。
+        max_lead = self._max_timing_lead()
+        max_lag = self._max_timing_lag()
+        earliest_start = max(0.0, source_start - max_lead)
+        latest_end = source_end + max_lag
+
+        start = max(earliest_start, source_end - target_duration)
         end = max(source_end, start + target_duration)
+        if end > latest_end:
+            end = latest_end
+            start = max(earliest_start, min(start, end - target_duration))
+        if start > source_start:
+            start = source_start
+        if end <= start:
+            end = start + 0.001
         return start, end
 
     def _resolve_timing_conflict(self, previous: Dict, current: Dict, current_source_start: float):

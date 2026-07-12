@@ -248,9 +248,15 @@ class Worker(QObject):
                 self.log_message.emit("未检测到可用静音点，将使用固定时间切分。")
 
             chunk_extension = self._chunk_extension_for_audio(audio_path)
-            self.log_message.emit(
-                f"分片将使用原始音频编码流复制，输出容器: {chunk_extension}"
-            )
+            if chunk_extension.lower() in self.REENCODE_CHUNK_CODEC_ARGS:
+                self.log_message.emit(
+                    f"分片将解码重编码以保证采样级精确切割（{chunk_extension} 不支持无缺口流复制），"
+                    f"输出容器: {chunk_extension}"
+                )
+            else:
+                self.log_message.emit(
+                    f"分片将使用原始音频编码流复制，输出容器: {chunk_extension}"
+                )
 
             self.owned_temp_chunks = []
             self.temp_chunks = []
@@ -412,9 +418,27 @@ class Worker(QObject):
         extension = os.path.splitext(audio_path)[1].lower()
         return extension or ".mka"
 
+    # 按源编码选择分片导出策略：
+    # - mp3: 帧无法在任意点流复制，实测切点会丢失约 0.1s 音频（后续整片时间轴偏移）
+    #   → 必须解码重编码，保证采样级精确切割、无缺口。
+    # - flac: 流复制内容完整，但 STREAMINFO 头沿用源文件总时长（分片元数据错误）
+    #   → 无损重编码，重建正确的容器元数据。
+    # - 其余 (aac/m4a/ogg/opus/wav/mka...): 流复制实测切点误差仅毫秒级且拼接无缺口，
+    #   保持无损快速复制，避免二次有损压缩与体积膨胀。
+    REENCODE_CHUNK_CODEC_ARGS = {
+        ".mp3": ["-c:a", "libmp3lame", "-b:a", "192k"],
+        ".flac": ["-c:a", "flac"],
+    }
+
+    def _chunk_codec_args(self, chunk_extension: str) -> List[str]:
+        return list(self.REENCODE_CHUNK_CODEC_ARGS.get(
+            chunk_extension.lower(), ["-c:a", "copy"]
+        ))
+
     def _export_audio_segment(self, audio_path: str, chunk_path: str,
                               start: float, end: float):
         duration = max(0.001, end - start)
+        codec_args = self._chunk_codec_args(os.path.splitext(chunk_path)[1])
         command = [
             "ffmpeg", "-hide_banner", "-nostdin", "-y",
             "-i", audio_path,
@@ -422,7 +446,7 @@ class Worker(QObject):
             "-t", f"{duration:.3f}",
             "-map", "0:a:0",
             "-vn",
-            "-c:a", "copy",
+            *codec_args,
             "-avoid_negative_ts", "make_zero",
             chunk_path
         ]
@@ -822,13 +846,21 @@ class Worker(QObject):
         if not isinstance(self.combined_transcript, dict):
             return
 
+        words = self.combined_transcript.get("words", [])
         timed_ends = [
             word.get("end")
-            for word in self.combined_transcript.get("words", [])
+            for word in words
             if isinstance(word.get("end"), (int, float))
         ]
         if timed_ends:
             self.combined_transcript["audio_duration_secs"] = round(max(timed_ends), 3)
+
+        # 顶层 text 从最终 words 重新生成，确保与去重后的词序列一致
+        # （否则 words 已去重、text 仍保留跨片重复词，导致 JSON 自相矛盾）。
+        if words:
+            self.combined_transcript["text"] = "".join(
+                word.get("text", "") for word in words
+            )
 
     def _on_async_progress_updated(self, chunk_index: int, bytes_sent: int, total_bytes: int):
         """异步处理进度更新回调"""

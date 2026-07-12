@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import json
+
 from api.client import Uploader
 from core.async_chunk_processor import AsyncChunkProcessor, ChunkProcessorTask, dedupe_boundary_words
 from core.intelligent_merger import IntelligentMerger
@@ -397,6 +399,43 @@ def test_worker_export_audio_segment_uses_stream_copy(monkeypatch):
     assert kwargs["check"] is True
 
 
+def test_worker_chunk_codec_args_reencode_mp3_and_flac():
+    # mp3 帧无法在任意点无缺口流复制、flac 流复制头元数据错误 -> 必须重编码；
+    # 其余容器无损流复制。
+    worker = Worker(
+        file_path="placeholder.m4a",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+    assert worker._chunk_codec_args(".mp3") == ["-c:a", "libmp3lame", "-b:a", "192k"]
+    assert worker._chunk_codec_args(".flac") == ["-c:a", "flac"]
+    assert worker._chunk_codec_args(".MP3") == ["-c:a", "libmp3lame", "-b:a", "192k"]
+    for keep_copy in (".ogg", ".m4a", ".aac", ".wav", ".mka"):
+        assert worker._chunk_codec_args(keep_copy) == ["-c:a", "copy"]
+
+
+def test_worker_export_audio_segment_reencodes_mp3(monkeypatch):
+    worker = Worker(
+        file_path="placeholder.mp3",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+    calls = []
+    monkeypatch.setattr("core.worker.subprocess.run",
+                        lambda command, **kwargs: calls.append(command))
+
+    worker._export_audio_segment("source.mp3", "chunk_000.mp3", 1.0, 4.0)
+
+    command = calls[0]
+    assert command[command.index("-c:a") + 1] == "libmp3lame"
+    assert "copy" not in command
+    assert "-avoid_negative_ts" in command
+
+
 def test_language_utils_identifies_cjk_codes():
     assert normalize_language_code("Japanese") == "jap"
     assert is_cjk_language("jpn")
@@ -671,3 +710,72 @@ def test_dedupe_boundary_words_noops_without_overlap_or_words():
     # 文本不同即使时间重叠也不删除
     new = [{"text": "b", "type": "word", "start": 0.5, "end": 1.2}]
     assert dedupe_boundary_words(existing, new) == new
+
+
+def _cue_times(srt):
+    times = []
+    for block in [b for b in srt.strip().split("\n\n") if b.strip()]:
+        line = block.split("\n")[1]
+        a, b = line.split(" --> ")
+        def to_s(t):
+            h, m, rest = t.split(":")
+            s, ms = rest.split(",")
+            return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+        times.append((to_s(a), to_s(b)))
+    return times
+
+
+def test_subtitle_lead_is_capped_for_fast_speech():
+    # 30 个词挤在 1.5s 内：短条需要更长阅读时间，但显示不得提前语音起点太多。
+    words = [
+        {"type": "word", "text": f"word{i} ",
+         "start": round(10.0 + i * 0.05, 3), "end": round(10.0 + i * 0.05 + 0.04, 3)}
+        for i in range(30)
+    ]
+    data = {"language_code": "eng", "words": words}
+    processor = SrtProcessor(data)
+    srt = processor.create_srt()
+    # 语音最早起点 10.0；提前量上限即 processor._max_timing_lead()
+    max_lead = processor._max_timing_lead()
+    first_start = _cue_times(srt)[0][0]
+    assert first_start >= 10.0 - max_lead - 0.01, (first_start, max_lead)
+
+
+def test_create_srt_is_idempotent_on_same_input():
+    # 同一个 dict 连续转换两次必须得到完全相同的结果（预处理不得修改输入对象）。
+    data = {
+        "language_code": "jpn",
+        "words": [
+            {"type": "word", "text": "まもなく", "start": 0.0, "end": 1.0},
+            {"type": "word", "text": "、", "start": 1.0, "end": 1.05},
+            {"type": "word", "text": "到着します", "start": 1.1, "end": 2.4},
+        ],
+    }
+    before = json.dumps(data, ensure_ascii=False, sort_keys=True)
+    srt1 = create_srt_from_json(data)
+    srt2 = create_srt_from_json(data)
+    after = json.dumps(data, ensure_ascii=False, sort_keys=True)
+    assert srt1 == srt2
+    assert before == after  # 输入对象未被就地修改
+
+
+def test_refresh_metadata_regenerates_text_from_words():
+    # 边界去重后，顶层 text 必须由最终 words 重新生成，二者保持一致。
+    worker = Worker(
+        file_path="placeholder.m4a",
+        language_code="eng",
+        tag_audio_events=False,
+        max_subtitle_duration=5.0,
+        split_duration_min=1,
+    )
+    worker.combined_transcript = {
+        "text": "hello hello world",  # 陈旧、含重复
+        "words": [
+            {"type": "word", "text": "hello", "start": 0.0, "end": 0.5},
+            {"type": "spacing", "text": " ", "start": 0.5, "end": 0.5},
+            {"type": "word", "text": "world", "start": 0.6, "end": 1.0},
+        ],
+    }
+    worker._refresh_combined_transcript_metadata()
+    assert worker.combined_transcript["text"] == "hello world"
+    assert worker.combined_transcript["audio_duration_secs"] == 1.0
