@@ -17,7 +17,7 @@ from PySide6.QtCore import QObject, Signal, QThreadPool
 
 from api.client import ElevenLabsSTTClient
 from .srt_processor import create_srt_from_json
-from .async_chunk_processor import AsyncChunkProcessor
+from .async_chunk_processor import AsyncChunkProcessor, dedupe_boundary_words
 from .ffmpeg_utils import get_media_info
 
 class Worker(QObject):
@@ -806,6 +806,8 @@ class Worker(QObject):
 
         words = transcript_json.get("words", [])
         self.combined_transcript.setdefault("words", [])
+        # 在分片边界去重跨片重复词（stream copy 重叠 / 固定切点切穿词）。
+        words = dedupe_boundary_words(self.combined_transcript["words"], words)
         self.combined_transcript["words"].extend(words)
 
         text = transcript_json.get("text", "")
@@ -855,8 +857,11 @@ class Worker(QObject):
         # 合并已有的转录结果和新的转录结果
         # 注意：remaining_transcript中的时间偏移已经在异步处理器中正确处理
         if self.combined_transcript and self.combined_transcript.get("words"):
-            # 已有部分转录结果，需要合并
-            self.combined_transcript["words"].extend(remaining_transcript.get("words", []))
+            # 已有部分转录结果，需要合并（边界去重跨片重复词）
+            remaining_words = dedupe_boundary_words(
+                self.combined_transcript["words"], remaining_transcript.get("words", [])
+            )
+            self.combined_transcript["words"].extend(remaining_words)
             if self.combined_transcript["text"]:
                 self.combined_transcript["text"] += " "
             self.combined_transcript["text"] += remaining_transcript.get("text", "")

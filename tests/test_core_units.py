@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from api.client import Uploader
-from core.async_chunk_processor import AsyncChunkProcessor, ChunkProcessorTask
+from core.async_chunk_processor import AsyncChunkProcessor, ChunkProcessorTask, dedupe_boundary_words
 from core.intelligent_merger import IntelligentMerger
 from core.language_utils import is_cjk_language, normalize_language_code
 from core.punctuation_handler import PunctuationHandler
@@ -631,3 +631,43 @@ def test_srt_processor_repairs_tiny_gap_when_room_is_available():
     )
     assert max_late_start <= processor._max_late_start_shift() + 0.001
     assert max_late_end <= processor._max_timing_lag() + 0.001
+
+
+def test_dedupe_boundary_words_drops_overlapping_duplicate():
+    # 上一分片尾部 "hello" 结束于 ≈5.02，新分片开头 "hello" 起始于 ≈5.00 —— 同一个跨界词。
+    existing = [
+        {"text": "say", "type": "word", "start": 4.5, "end": 4.9},
+        {"text": "hello", "type": "word", "start": 4.95, "end": 5.02},
+    ]
+    new = [
+        {"text": "hello", "type": "word", "start": 5.00, "end": 5.08},
+        {"text": "world", "type": "word", "start": 5.20, "end": 5.60},
+    ]
+
+    result = dedupe_boundary_words(existing, new)
+
+    assert [w["text"] for w in result] == ["world"]
+
+
+def test_dedupe_boundary_words_keeps_legitimate_repeat():
+    # 连续重复说出的 "hai"：时间区间不重叠，必须保留两个。
+    existing = [
+        {"text": "hai", "type": "word", "start": 4.6, "end": 4.9},
+    ]
+    new = [
+        {"text": "hai", "type": "word", "start": 5.10, "end": 5.40},
+        {"text": "next", "type": "word", "start": 5.50, "end": 5.90},
+    ]
+
+    result = dedupe_boundary_words(existing, new)
+
+    assert [w["text"] for w in result] == ["hai", "next"]
+
+
+def test_dedupe_boundary_words_noops_without_overlap_or_words():
+    assert dedupe_boundary_words([], [{"text": "a", "start": 0, "end": 1}]) == [{"text": "a", "start": 0, "end": 1}]
+    existing = [{"text": "a", "type": "word", "start": 0.0, "end": 1.0}]
+    assert dedupe_boundary_words(existing, []) == []
+    # 文本不同即使时间重叠也不删除
+    new = [{"text": "b", "type": "word", "start": 0.5, "end": 1.2}]
+    assert dedupe_boundary_words(existing, new) == new

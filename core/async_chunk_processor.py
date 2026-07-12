@@ -7,11 +7,60 @@
 
 import os
 import json
+import re
 import time
 from typing import List, Dict, Any, Optional, Callable
 from PySide6.QtCore import QObject, Signal, QMutex, QMutexLocker, QSemaphore, QRunnable
 
 from api.client import ElevenLabsSTTClient
+
+
+def _normalized_word_text(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "")).strip().lower()
+
+
+def dedupe_boundary_words(existing_words: List[Dict], new_words: List[Dict],
+                          window: int = 3) -> List[Dict]:
+    """丢弃新分片开头与上一分片结尾在切割边界处重复的词。
+
+    分片用 stream copy 在音频包边界切割会产生数十毫秒重叠；切点回退到固定点时还可能
+    切穿一个词，导致同一个词在相邻分片各转录一次。这里只在边界窗口内，按"文本相同且
+    时间区间重叠"判定重复并丢弃新片开头的重复词。真正连续重复说出的词（如"はい はい"）
+    时间区间不重叠，因此不会被误删。返回去重后的 new_words（可能原样返回）。
+    """
+    if not existing_words or not new_words:
+        return new_words
+
+    tail = [
+        word for word in existing_words[-window:]
+        if isinstance(word.get("start"), (int, float)) and isinstance(word.get("end"), (int, float))
+    ]
+    if not tail:
+        return new_words
+
+    result = list(new_words)
+    removed = 0
+    while result and removed < window:
+        candidate = result[0]
+        start, end = candidate.get("start"), candidate.get("end")
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            break
+        candidate_text = _normalized_word_text(candidate.get("text"))
+        if not candidate_text:
+            break
+
+        is_duplicate = any(
+            _normalized_word_text(tail_word.get("text")) == candidate_text and
+            max(start, tail_word["start"]) < min(end, tail_word["end"]) - 0.001
+            for tail_word in tail
+        )
+        if not is_duplicate:
+            break
+
+        result.pop(0)
+        removed += 1
+
+    return result
 
 
 class ChunkProcessorSignals(QObject):
@@ -389,8 +438,10 @@ class AsyncChunkProcessor(QObject):
 
             transcript = self.completed_chunks[i]
 
-            # 直接追加words（时间偏移已经在ChunkTask中处理）
-            words = transcript.get("words", [])
+            # 直接追加words（时间偏移已经在ChunkTask中处理），并在边界去重跨片重复词。
+            words = dedupe_boundary_words(
+                combined_transcript["words"], transcript.get("words", [])
+            )
             combined_transcript["words"].extend(words)
 
             # 拼接文本
