@@ -222,8 +222,11 @@ class SrtProcessor:
             return [entry]
 
         words = [word for word in entry.get('words', []) if word.get('type') == 'word']
+        if not words:
+            return [entry]
+
         if len(words) <= 1 or depth >= 12:
-            return self._split_single_word_entry(entry) if words else [entry]
+            return self._split_single_word_entry(entry)
 
         split_index = self._find_best_word_split(words)
         if split_index is None:
@@ -231,6 +234,11 @@ class SrtProcessor:
 
         left = self._build_entry_from_words(words[:split_index], entry)
         right = self._build_entry_from_words(words[split_index:], entry)
+        # 只有最右侧片段继承原条目的"句尾"属性；左侧为句子中段，不补句末标点。
+        # 这样零时长词簇被递归拆成单字后也不会逐字插句号（"声。量。本。"），
+        # 后续 timing-pressure 再按 CPL/两行规则合并回可读条目。
+        left['is_sentence_final'] = False
+        right['is_sentence_final'] = entry.get('is_sentence_final', True)
 
         return (
             self._split_entry_if_needed(left, depth + 1) +
@@ -302,6 +310,7 @@ class SrtProcessor:
             source_word['start'] = round(cursor, 3)
             source_word['end'] = round(piece_end, 3)
 
+            is_last_piece = (index == len(pieces) - 1)
             split_entries.append({
                 'text': piece,
                 'start': source_word['start'],
@@ -309,7 +318,9 @@ class SrtProcessor:
                 'words': [source_word],
                 'is_audio_event': entry.get('is_audio_event', False),
                 'word_count': 1,
-                'char_count': self._count_readable_chars(piece)
+                'char_count': self._count_readable_chars(piece),
+                # 仅最后一段是句尾；前面的都是句子中段，不补句末标点。
+                'is_sentence_final': entry.get('is_sentence_final', True) if is_last_piece else False
             })
             cursor = piece_end
 
@@ -380,7 +391,8 @@ class SrtProcessor:
             'words': [word.copy() for word in words],
             'is_audio_event': template.get('is_audio_event', False),
             'word_count': len(actual_words),
-            'char_count': self._count_readable_chars(text)
+            'char_count': self._count_readable_chars(text),
+            'is_sentence_final': template.get('is_sentence_final', True)
         }
 
     def _find_best_word_split(self, words: List[Dict]) -> int:
@@ -534,6 +546,13 @@ class SrtProcessor:
                 current['start'] = previous['end'] + 0.001
                 if current['end'] <= current['start']:
                     current['end'] = current['start'] + 0.001
+
+        # 音频事件在密集/退化时间区不应被压成不可见的 1ms。保证其最小显示时长，
+        # 与后续条目的重叠留给下一轮冲突解决处理（音频事件自身受 _minimum_timing_end 保护）。
+        if current.get('is_audio_event', False):
+            min_event_end = current['start'] + min(self.min_subtitle_duration, self.max_subtitle_duration)
+            if current['end'] < min_event_end:
+                current['end'] = min_event_end
 
     def _minimum_timing_end(self, entry: Dict) -> float:
         if entry.get('is_audio_event', False):
@@ -774,6 +793,12 @@ class SrtProcessor:
         return entry.get('start', 0), entry.get('end', 0)
 
     def _apply_terminal_punctuation(self, entry: Dict) -> Dict:
+        # 音频事件（如"(拍手)"）不是句子，永远不补句末标点。
+        if entry.get('is_audio_event', False):
+            return entry
+        # 因显示/时长约束被拆开的句子中段不是句尾，补句号会在句子内部插入标点。
+        if not entry.get('is_sentence_final', True):
+            return entry
         normalized_entry = entry.copy()
         normalized_entry['text'] = self._ensure_terminal_punctuation(
             normalized_entry.get('text', '')
@@ -883,7 +908,9 @@ class SrtProcessor:
             'words': words,
             'is_audio_event': False,
             'word_count': entry1.get('word_count', 0) + entry2.get('word_count', 0),
-            'char_count': self._count_readable_chars(text)
+            'char_count': self._count_readable_chars(text),
+            # 合并后条目终止于 entry2 结尾，句尾属性随 entry2。
+            'is_sentence_final': entry2.get('is_sentence_final', True)
         }
 
     def _join_text(self, text1: str, text2: str) -> str:

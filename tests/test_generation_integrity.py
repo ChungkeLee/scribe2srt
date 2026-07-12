@@ -33,12 +33,12 @@ def _source_text_from_processor(processor: SrtProcessor) -> str:
 
 
 def _srt_text(srt: str) -> str:
+    # 按 SRT 块结构提取正文（跳过序号行与时间行），而不是用 isdigit 猜测。
+    # 全角数字正文行（如 "３"）的 str.isdigit() 为 True，按内容猜测会误删正文。
     text_lines = []
-    for line in srt.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.isdigit() or "-->" in stripped:
-            continue
-        text_lines.append(stripped)
+    for block in [b for b in srt.strip().split("\n\n") if b.strip()]:
+        lines = block.split("\n")
+        text_lines.extend(lines[2:])
     return _normalize_spacing("".join(text_lines))
 
 
@@ -114,15 +114,19 @@ def test_sample_json_generation_is_complete_and_rule_compliant(tmp_path):
         result = analyzer.analyze_subtitle_rules(str(srt_path))
         assert "error" not in result
 
-        timing_pressure_violations = {
+        # 这些类别在"精准时间轴优先"策略下会有少量残留，作为压力项容忍（见后处理说明）。
+        tolerated_violations = {
             "duration_too_short",
             "gap_too_small",
             "cps_too_high",
+            # 因显示约束被拆开的句子中段是延续镜头，按专业规范不补句末标点，
+            # 因此"末尾非标点"不再是硬性违规（修复了句中被强插句号的回归）。
+            "punctuation_issues",
         }
         violations = {
             name: values
             for name, values in result["violations"].items()
-            if values and name not in timing_pressure_violations
+            if values and name not in tolerated_violations
         }
         assert violations == {}, f"{sample_path}: {violations}"
 
@@ -177,6 +181,110 @@ def test_dense_json_timeline_does_not_accumulate_drift():
         for entry in entries
     )
     _assert_no_material_timeline_drift(entries, max_start_lag=0.15)
+
+
+def _parse_cues(srt: str):
+    """Return list of (start, end, [text_lines]) from an SRT string."""
+    cues = []
+    for block in [b for b in srt.strip().split("\n\n") if b.strip()]:
+        lines = block.split("\n")
+        times = lines[1].split(" --> ")
+        cues.append((_srt_time_to_seconds(times[0]), _srt_time_to_seconds(times[1]), lines[2:]))
+    return cues
+
+
+def _srt_time_to_seconds(text: str) -> float:
+    hours, minutes, rest = text.strip().split(":")
+    seconds, millis = rest.split(",")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000
+
+
+def test_audio_event_keeps_original_text_without_terminal_punctuation():
+    """回归：音频事件不应被补句末标点，如 (拍手) 不得变成 (拍手。)。"""
+    data = {
+        "language_code": "jpn",
+        "words": [
+            {"type": "word", "text": "こんにちは", "start": 0.0, "end": 1.0},
+            {"type": "audio_event", "text": "(拍手)", "start": 1.2, "end": 2.0},
+        ],
+    }
+    srt = create_srt_from_json(data)
+    event_lines = [ln for cue in _parse_cues(srt) for ln in cue[2] if ln.startswith("(")]
+    assert event_lines, "audio event cue should be present"
+    for line in event_lines:
+        assert line == "(拍手)", f"audio event must stay verbatim, got {line!r}"
+
+
+def test_audio_event_not_collapsed_to_flash_in_dense_zone():
+    """回归：密集/退化时间区中的音频事件不应被压成 1ms 闪现。"""
+    data = {
+        "language_code": "jpn",
+        "words": [
+            {"type": "word", "text": "あ", "start": 5.0, "end": 5.0},
+            {"type": "word", "text": "い", "start": 5.0, "end": 5.0},
+            {"type": "audio_event", "text": "(笑い)", "start": 5.0, "end": 5.0},
+            {"type": "word", "text": "うえお", "start": 5.0, "end": 5.0},
+        ],
+    }
+    processor = SrtProcessor(data)
+    _, entries = _capture_entries(processor)
+    events = [e for e in entries if e.get("is_audio_event")]
+    assert events, "audio event entry should survive"
+    for event in events:
+        duration = event["end"] - event["start"]
+        assert duration >= processor.min_subtitle_duration - 0.01, (
+            f"audio event collapsed to {duration:.3f}s"
+        )
+
+
+def test_zero_duration_cluster_is_not_exploded_into_per_char_punctuation():
+    """回归：源含零时长词簇时，不得逐字插句号（如 声。量。本。）。"""
+    text = "声量本身反而成为一种网民自发"
+    words = [{"type": "word", "text": ch, "start": 10.0, "end": 10.0} for ch in text]
+    srt = create_srt_from_json({"language_code": "zho", "words": words})
+
+    cues = _parse_cues(srt)
+    joined = "".join(ln for _, _, lines in cues for ln in lines)
+    # 内容不丢失
+    assert all(ch in joined for ch in text)
+    # 注入的句号数量应远小于字符数（理想为每条至多一个句尾句号）
+    assert joined.count("。") <= len(cues), (
+        f"terminal punctuation exploded per-character: {joined!r}"
+    )
+    # 不应出现"句号夹在两个汉字中间"的乱码模式
+    for index, char in enumerate(joined):
+        if char == "。" and index + 1 < len(joined):
+            following = joined[index + 1]
+            assert following in "。）」』】》" or index == len(joined) - 1, (
+                f"period injected mid-text before {following!r}: {joined!r}"
+            )
+
+
+def test_mid_sentence_split_has_no_injected_terminal_punctuation():
+    """回归：因长度被拆开的句子中段不应被强插句号，仅句尾补一次。"""
+    text = "これはとても長い文章でありながら内部には句読点がまったく存在しないため分割位置の判断が難しい文です"
+    words = [
+        {"type": "word", "text": ch, "start": round(i * 0.2, 2), "end": round(i * 0.2 + 0.18, 2)}
+        for i, ch in enumerate(text)
+    ]
+    words[-1]["text"] += "。"
+    srt = create_srt_from_json({"language_code": "jpn", "words": words})
+
+    cues = _parse_cues(srt)
+    assert len(cues) >= 2, "long sentence should split into multiple cues"
+
+    joined_lines = [ln for _, _, lines in cues for ln in lines]
+    # 每一行内部都不应出现"汉字。汉字"式的句中句号
+    for line in joined_lines:
+        for index, char in enumerate(line[:-1]):
+            if char == "。":
+                assert line[index + 1] in "。）」』】》", f"mid-line period in {line!r}"
+    # 只有整体最后一条以句号收尾
+    non_final_lines = joined_lines[:-1]
+    assert not any(ln.endswith("。") for ln in non_final_lines), (
+        f"continuation cues should not end with a period: {non_final_lines}"
+    )
+    assert joined_lines[-1].endswith("。"), "the true sentence end should keep its period"
 
 
 def _transcript(chunk_index: int) -> dict:
