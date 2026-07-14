@@ -146,13 +146,17 @@ class ElevenLabsSTTClient:
         if self._signals and hasattr(self._signals, 'log_message'):
             self._signals.log_message.emit(f"{message}")
 
-    def log_media_info(self, file_path: str) -> Optional[Dict[str, Any]]:
+    def log_media_info(self, file_path: str, cancel_check=None) -> Optional[Dict[str, Any]]:
         """Logs file size and, if possible, media duration and codec."""
         try:
             file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
             log_str = f"  文件大小: {file_size_mb:.2f} MB"
 
-            media_info = get_media_info(file_path, self._log)
+            media_info = get_media_info(
+                file_path,
+                self._log,
+                cancel_check=cancel_check,
+            )
             if media_info:
                 duration = media_info.get("duration")
                 codec = media_info.get("codec")

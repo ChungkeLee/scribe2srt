@@ -135,6 +135,105 @@ class SrtProcessor:
             # word 对象，否则同一个 JSON 二次转换会出现重复标点（不幂等）。
             self.words.append(word_info.copy())
 
+        self._repair_degenerate_word_timestamps()
+
+    def _repair_degenerate_word_timestamps(self):
+        """Interpolate consecutive zero/negative-duration word clusters.
+
+        Some transcripts contain hundreds of consecutive characters sharing one
+        timestamp.  Leaving those values untouched makes the later subtitle
+        scheduler choose between hundreds of overlapping cues and several seconds
+        of artificial delay.  When the cluster is bounded by valid neighbouring
+        timestamps, distribute it over that real interval before sentence
+        splitting.  This only mutates the processor-owned copies created above.
+        """
+        index = 0
+        while index < len(self.words):
+            word = self.words[index]
+            start = word.get('start')
+            end = word.get('end')
+            is_degenerate = (
+                isinstance(start, (int, float)) and
+                isinstance(end, (int, float)) and
+                end - start <= 0.001
+            )
+            if not is_degenerate:
+                index += 1
+                continue
+
+            run_start = index
+            anchor_start = float(start)
+            while index < len(self.words):
+                current = self.words[index]
+                current_start = current.get('start')
+                current_end = current.get('end')
+                if not (
+                    isinstance(current_start, (int, float)) and
+                    isinstance(current_end, (int, float)) and
+                    current_end - current_start <= 0.001 and
+                    abs(float(current_start) - anchor_start) <= 0.002
+                ):
+                    break
+                index += 1
+            run_end = index
+
+            # A lone point-like token can be legitimate.  Only interpolate a
+            # repeated timestamp cluster, which is the corrupt shape this repair
+            # is intended to handle.
+            if run_end - run_start < 2:
+                continue
+
+            previous_end = None
+            if run_start > 0:
+                candidate = self.words[run_start - 1].get('end')
+                if isinstance(candidate, (int, float)):
+                    previous_end = candidate
+
+            next_start = None
+            next_end = None
+            if run_end < len(self.words):
+                candidate_start = self.words[run_end].get('start')
+                candidate_end = self.words[run_end].get('end')
+                if isinstance(candidate_start, (int, float)):
+                    next_start = candidate_start
+                if isinstance(candidate_end, (int, float)):
+                    next_end = candidate_end
+
+            raw_starts = [
+                float(self.words[position].get('start'))
+                for position in range(run_start, run_end)
+            ]
+            left_bound = max(0.0, previous_end if previous_end is not None else min(raw_starts))
+
+            # A common corrupt shape is a large zero-duration run followed by one
+            # token that starts at the same stale timestamp but finally has a valid
+            # end.  Treat that token as the last member of the run so its end can
+            # provide the real interpolation boundary.
+            if (
+                run_end < len(self.words) and
+                next_start is not None and next_end is not None and
+                abs(next_start - anchor_start) <= 0.002 and
+                next_end > anchor_start + 0.001
+            ):
+                run_end += 1
+                index = run_end
+                next_start = next_end
+
+            if next_start is None or next_start <= left_bound + 0.001:
+                continue
+
+            run_length = run_end - run_start
+            step = (next_start - left_bound) / run_length
+            if step < 0.001:
+                continue
+
+            cursor = left_bound
+            for position in range(run_start, run_end):
+                repaired_end = next_start if position == run_end - 1 else cursor + step
+                self.words[position]['start'] = round(cursor, 3)
+                self.words[position]['end'] = round(max(cursor + 0.001, repaired_end), 3)
+                cursor = repaired_end
+
     def _create_audio_event_entries(self) -> List[Dict]:
         """
         为音频事件创建独立的字幕条目
@@ -208,6 +307,11 @@ class SrtProcessor:
         all_entries = [self._apply_terminal_punctuation(entry) for entry in all_entries]
         all_entries = self._normalize_timeline(all_entries)
         all_entries = self._repair_timing_pressure(all_entries)
+        # Timing repair contains several local optimization passes.  Treat source
+        # synchronization as a final invariant as those passes may otherwise move
+        # dense or degenerate entries outside the bounds chosen initially.
+        all_entries = self._enforce_final_timing_bounds(all_entries)
+        all_entries = self._prepare_serializable_entries(all_entries)
 
         # Stage 5: Generate final SRT content with optimized display formatting
         return self._generate_final_srt_content(all_entries)
@@ -589,6 +693,283 @@ class SrtProcessor:
         repaired = self._enforce_minimum_gaps_locally(repaired)
         repaired = self._extend_entries_with_local_room(repaired)
         return repaired
+
+    def _enforce_final_timing_bounds(self, entries: List[Dict]) -> List[Dict]:
+        """Clamp the final display timeline to each entry's source interval.
+
+        Readability constraints are intentionally soft here.  Once all merging and
+        local gap repair has finished, synchronization must win over CPS and minimum
+        display duration.  This also prevents zero-duration word clusters and audio
+        events from being queued several seconds after their source timestamp.
+        """
+        bounded = []
+
+        for entry in sorted(
+            (item.copy() for item in entries),
+            key=lambda item: self._entry_time_bounds(item)[0]
+        ):
+            current = entry.copy()
+            source_start, source_end = self._entry_time_bounds(current)
+            source_start = max(0.0, source_start)
+            source_end = max(source_start, source_end)
+
+            if current.get('is_audio_event', False):
+                # Events may coincide with speech.  Keep them anchored to the event
+                # instead of pushing a series of simultaneous events down the
+                # timeline.  A fixed extension makes a zero-duration event visible
+                # without introducing cumulative drift.
+                current['start'] = source_start
+                event_duration = max(
+                    source_end - source_start,
+                    min(self.min_subtitle_duration, self.max_subtitle_duration)
+                )
+                current['end'] = min(
+                    source_start + self.max_subtitle_duration,
+                    source_start + event_duration
+                )
+            else:
+                earliest_start = max(0.0, source_start - self._max_timing_lead())
+                latest_start = source_start + self._max_late_start_shift()
+                latest_end = source_end + self._max_timing_lag()
+
+                if source_end - source_start <= 0.001:
+                    # Put a degenerate cluster at the beginning of its allowed
+                    # window.  The non-overlap pass below can then distribute its
+                    # pieces by milliseconds instead of stacking all of them at
+                    # the latest permitted timestamp.
+                    current['start'] = earliest_start
+                else:
+                    current['start'] = min(
+                        latest_start,
+                        max(earliest_start, current.get('start', source_start))
+                    )
+                current['end'] = min(
+                    latest_end,
+                    current.get('end', source_end)
+                )
+
+                # Preserve source coverage where possible.  Degenerate source
+                # clusters only require the serialization-safe one millisecond.
+                if source_end > source_start:
+                    current['end'] = max(current['end'], source_end)
+                current['end'] = min(
+                    current['end'],
+                    current['start'] + self.max_subtitle_duration
+                )
+
+                if current['end'] <= current['start']:
+                    current['end'] = min(latest_end, current['start'] + 0.001)
+                    if current['end'] <= current['start']:
+                        current['start'] = max(earliest_start, current['end'] - 0.001)
+
+            if current['end'] <= current['start']:
+                current['end'] = current['start'] + 0.001
+            bounded.append(current)
+
+        return bounded
+
+    def _prepare_serializable_entries(self, entries: List[Dict]) -> List[Dict]:
+        """Build the final non-overlapping timeline before SRT serialization.
+
+        SRT has no layering model.  Audio events that genuinely overlap dialogue
+        are therefore co-displayed in that dialogue cue; delaying them until the
+        dialogue ends would be materially less accurate.  Standalone simultaneous
+        events are merged into one cue.  Finally, dense entries sharing one broken
+        point timestamp are distributed inside the allowed lead/lag window.
+        """
+        prepared = self._coalesce_overlapping_audio_events(entries)
+        prepared = self._schedule_degenerate_timestamp_groups(prepared)
+        return self._quantize_non_overlapping_timeline(prepared)
+
+    def _coalesce_overlapping_audio_events(self, entries: List[Dict]) -> List[Dict]:
+        speech_entries = [entry.copy() for entry in entries if not entry.get('is_audio_event', False)]
+        event_entries = [entry.copy() for entry in entries if entry.get('is_audio_event', False)]
+        standalone_events = []
+
+        for event in event_entries:
+            event_start, event_end = self._entry_time_bounds(event)
+            event_end = max(event_start, event_end)
+            candidates = []
+            for index, speech in enumerate(speech_entries):
+                speech_start, speech_end = self._entry_time_bounds(speech)
+                overlap = max(0.0, min(event_end, speech_end) - max(event_start, speech_start))
+                point_inside = (
+                    event_end - event_start <= 0.001 and
+                    speech_start - 0.001 <= event_start <= speech_end + 0.001
+                )
+                if overlap > 0.001 or point_inside:
+                    distance = abs((speech_start + speech_end) / 2.0 - event_start)
+                    candidates.append((overlap, -distance, index))
+
+            if not candidates:
+                standalone_events.append(event)
+                continue
+
+            _, _, target_index = max(candidates)
+            target = speech_entries[target_index]
+            embedded = list(target.get('embedded_audio_events', []))
+            embedded.append(event.get('text', '').strip())
+            target['embedded_audio_events'] = [text for text in embedded if text]
+            base_text = target.get('base_dialogue_text', target.get('text', '')).strip()
+            target['base_dialogue_text'] = base_text
+            target['text'] = ' '.join([base_text, *target['embedded_audio_events']]).strip()
+            target['char_count'] = self._count_readable_chars(target['text'])
+
+        # Events that overlap one another but not speech must share a cue; otherwise
+        # a serializer can only delay or collapse one of them.
+        merged_events = []
+        for event in sorted(standalone_events, key=lambda item: self._entry_time_bounds(item)[0]):
+            if not merged_events:
+                merged_events.append(event)
+                continue
+
+            previous = merged_events[-1]
+            previous_start, previous_end = self._entry_time_bounds(previous)
+            current_start, current_end = self._entry_time_bounds(event)
+            overlap = min(previous_end, current_end) - max(previous_start, current_start)
+            both_same_point = (
+                previous_end - previous_start <= 0.001 and
+                current_end - current_start <= 0.001 and
+                abs(previous_start - current_start) <= 0.001
+            )
+            source_overlap = overlap > 0.001 or both_same_point
+            if not source_overlap:
+                merged_events.append(event)
+                continue
+
+            previous['text'] = ' '.join(
+                text for text in (previous.get('text', '').strip(), event.get('text', '').strip())
+                if text
+            )
+            previous['words'] = list(previous.get('words', [])) + list(event.get('words', []))
+            previous['start'] = min(previous.get('start', previous_start), event.get('start', current_start))
+            previous['end'] = max(previous.get('end', previous_end), event.get('end', current_end))
+            previous['char_count'] = self._count_readable_chars(previous['text'])
+
+        speech_entries = self._split_embedded_event_overflow(speech_entries)
+
+        return sorted(
+            speech_entries + merged_events,
+            key=lambda item: (self._entry_time_bounds(item)[0], item.get('is_audio_event', False))
+        )
+
+    def _split_embedded_event_overflow(self, entries: List[Dict]) -> List[Dict]:
+        """Re-split a co-display cue if adding an event exceeds two-line CPL."""
+        result = []
+        for entry in entries:
+            if not entry.get('embedded_audio_events') or self._entry_is_compliant(entry):
+                result.append(entry)
+                continue
+
+            lines = self._wrap_text_unlimited(entry.get('text', ''))
+            line_groups = [lines[index:index + 2] for index in range(0, len(lines), 2)]
+            start = entry.get('start', 0.0)
+            end = max(start + 0.001, entry.get('end', start + 0.001))
+            part_duration = (end - start) / max(1, len(line_groups))
+
+            for index, line_group in enumerate(line_groups):
+                part_start = start + index * part_duration
+                part_end = end if index == len(line_groups) - 1 else start + (index + 1) * part_duration
+                part_text = '\n'.join(line_group)
+                synthetic_word = {
+                    'type': 'word',
+                    'text': part_text,
+                    'start': part_start,
+                    'end': part_end,
+                }
+                result.append({
+                    'text': part_text,
+                    'start': part_start,
+                    'end': part_end,
+                    'words': [synthetic_word],
+                    'is_audio_event': False,
+                    'word_count': 1,
+                    'char_count': self._count_readable_chars(part_text),
+                    'is_sentence_final': index == len(line_groups) - 1,
+                    'contains_embedded_audio_event': True,
+                })
+
+        return result
+
+    def _schedule_degenerate_timestamp_groups(self, entries: List[Dict]) -> List[Dict]:
+        scheduled = [entry.copy() for entry in entries]
+        index = 0
+        while index < len(scheduled):
+            entry = scheduled[index]
+            if entry.get('is_audio_event', False):
+                index += 1
+                continue
+
+            source_start, source_end = self._entry_time_bounds(entry)
+            if source_end - source_start > 0.001:
+                index += 1
+                continue
+
+            group_end = index + 1
+            while group_end < len(scheduled):
+                candidate = scheduled[group_end]
+                candidate_start, candidate_end = self._entry_time_bounds(candidate)
+                if (
+                    candidate.get('is_audio_event', False) or
+                    candidate_end - candidate_start > 0.001 or
+                    abs(candidate_start - source_start) > 0.001 or
+                    abs(candidate_end - source_end) > 0.001
+                ):
+                    break
+                group_end += 1
+
+            group_size = group_end - index
+            if group_size > 1:
+                earliest = max(0.0, source_start - self._max_timing_lead())
+                latest_end = max(source_start + 0.001, source_end + self._max_timing_lag())
+                # Broken point timestamps provide no real per-entry timing.  Pack
+                # the cues at one millisecond each as close to the source point as
+                # possible instead of spreading them seconds early or late.
+                group_start = max(earliest, min(source_start, latest_end - group_size * 0.001))
+                for offset, position in enumerate(range(index, group_end)):
+                    start = group_start + offset * 0.001
+                    scheduled[position]['start'] = start
+                    scheduled[position]['end'] = start + 0.001
+
+            index = group_end
+
+        return scheduled
+
+    def _quantize_non_overlapping_timeline(self, entries: List[Dict]) -> List[Dict]:
+        """Resolve remaining conflicts and align the final model to SRT milliseconds."""
+        quantized = []
+        for entry in sorted(
+            (item.copy() for item in entries),
+            key=lambda item: (self._entry_time_bounds(item)[0], item.get('is_audio_event', False))
+        ):
+            current = entry.copy()
+            start_ms = max(0, int(round(current.get('start', 0.0) * 1000)))
+            end_ms = max(start_ms + 1, int(round(current.get('end', 0.0) * 1000)))
+
+            if quantized and start_ms < quantized[-1]['end_ms']:
+                previous = quantized[-1]
+                previous_entry = previous['entry']
+                previous_source_start, previous_source_end = self._entry_time_bounds(previous_entry)
+                current_source_start, current_source_end = self._entry_time_bounds(current)
+
+                if previous_source_end <= current_source_start:
+                    boundary_ms = int(round(current_source_start * 1000))
+                else:
+                    boundary_ms = int(round((previous_source_end + current_source_start) * 500))
+
+                boundary_ms = max(previous['start_ms'] + 1, boundary_ms)
+                boundary_ms = min(end_ms - 1, boundary_ms)
+                if boundary_ms > previous['start_ms']:
+                    previous['end_ms'] = min(previous['end_ms'], boundary_ms)
+                    previous['entry']['end'] = previous['end_ms'] / 1000.0
+                start_ms = max(start_ms, previous['end_ms'])
+                end_ms = max(end_ms, start_ms + 1)
+
+            current['start'] = start_ms / 1000.0
+            current['end'] = end_ms / 1000.0
+            quantized.append({'entry': current, 'start_ms': start_ms, 'end_ms': end_ms})
+
+        return [item['entry'] for item in quantized]
 
     def _merge_timing_pressure_entries(self, entries: List[Dict]) -> List[Dict]:
         repaired = sorted((entry.copy() for entry in entries), key=lambda x: x['start'])
@@ -993,11 +1374,11 @@ class SrtProcessor:
             return ""
         
         srt_lines = []
-        
         for i, entry in enumerate(entries, 1):
-            # Format timing
-            start_time_str = format_srt_time(entry['start'])
-            end_time_str = format_srt_time(entry['end'])
+            start_ms = max(0, int(round(entry['start'] * 1000)))
+            end_ms = max(start_ms + 1, int(round(entry['end'] * 1000)))
+            start_time_str = format_srt_time(start_ms / 1000)
+            end_time_str = format_srt_time(end_ms / 1000)
             
             # Optimize text display format
             formatted_text = self._optimize_text_display(entry['text'])
@@ -1021,6 +1402,13 @@ class SrtProcessor:
         text = text.strip()
         if not text:
             return text
+
+        explicit_lines = text.splitlines()
+        if (
+            1 < len(explicit_lines) <= 2 and
+            all(len(line) <= self.max_chars_per_line for line in explicit_lines)
+        ):
+            return "\n".join(explicit_lines)
         
         # If text fits in single line, return as-is
         if len(text) <= self.max_chars_per_line:

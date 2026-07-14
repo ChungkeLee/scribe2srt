@@ -7,10 +7,12 @@
 import os
 import sys
 import json
+import math
 import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 
 from PySide6.QtCore import QObject, Signal, QThreadPool
@@ -19,6 +21,17 @@ from api.client import ElevenLabsSTTClient
 from .srt_processor import create_srt_from_json
 from .async_chunk_processor import AsyncChunkProcessor, dedupe_boundary_words
 from .ffmpeg_utils import get_media_info
+
+
+@dataclass(frozen=True)
+class ChunkExportProfile:
+    """一次切片任务使用的输出容器和编码策略。"""
+
+    extension: str
+    codec_args: Tuple[str, ...]
+    stream_copy: bool
+    description: str
+    full_timeline_decode: bool = False
 
 class Worker(QObject):
     """
@@ -67,6 +80,7 @@ class Worker(QObject):
             self.api_rate_limit_per_minute = api_rate_limit_per_minute
 
         self._is_cancelled = False
+        self._active_ffmpeg_process = None
         
         if self.restore_state:
             self.temp_chunks = self.restore_state.get("temp_chunks", [])
@@ -197,8 +211,25 @@ class Worker(QObject):
         self.log_message.emit("="*50)
         self.log_message.emit(f"开始处理文件: {os.path.basename(self.original_file_path)}")
 
-        media_info = self.client.log_media_info(self.file_path)
-        duration = media_info.get("duration") if media_info else 0
+        media_info = self.client.log_media_info(
+            self.file_path,
+            cancel_check=lambda: self._is_cancelled,
+        )
+        duration = media_info.get("duration") if media_info else None
+        if (
+            self.ffmpeg_available and
+            (
+                not media_info or
+                not isinstance(duration, (int, float)) or
+                not math.isfinite(duration) or
+                duration <= 0
+            )
+        ):
+            if self._is_cancelled:
+                return
+            self.error.emit("无法读取媒体时长，不能安全判断是否需要切分。")
+            return
+        duration = duration or 0
 
         if duration > self.split_duration_sec and self.ffmpeg_available:
             self.log_message.emit(f"文件时长超过 {self.split_duration_sec / 60:.0f} 分钟，将执行自动切分。")
@@ -229,7 +260,11 @@ class Worker(QObject):
         try:
             self._cleanup_owned_chunk_artifacts()
 
-            media_info = get_media_info(audio_path, lambda message: self.log_message.emit(message))
+            media_info = get_media_info(
+                audio_path,
+                lambda message: self.log_message.emit(message),
+                cancel_check=lambda: self._is_cancelled,
+            )
             duration = media_info.get("duration") if media_info else None
             if not duration or duration <= 0:
                 raise RuntimeError("无法获取音频时长，不能安全切分。")
@@ -247,28 +282,32 @@ class Worker(QObject):
             else:
                 self.log_message.emit("未检测到可用静音点，将使用固定时间切分。")
 
-            chunk_extension = self._chunk_extension_for_audio(audio_path)
-            if chunk_extension.lower() in self.REENCODE_CHUNK_CODEC_ARGS:
-                self.log_message.emit(
-                    f"分片将解码重编码以保证采样级精确切割（{chunk_extension} 不支持无缺口流复制），"
-                    f"输出容器: {chunk_extension}"
-                )
-            else:
-                self.log_message.emit(
-                    f"分片将使用原始音频编码流复制，输出容器: {chunk_extension}"
-                )
+            export_profile = self._select_chunk_export_profile(audio_path, media_info)
+            chunk_extension = export_profile.extension
+            self.log_message.emit(export_profile.description)
 
             self.owned_temp_chunks = []
             self.temp_chunks = []
             self.chunk_offsets = []
 
+            export_jobs = []
             for index, (start, end) in enumerate(segment_ranges):
+                if self._is_cancelled:
+                    raise RuntimeError("任务已取消。")
                 chunk_path = os.path.join(
                     self.temp_chunk_dir,
                     f"{base_name}_chunk_{index:03d}{chunk_extension}"
                 )
-                self._export_audio_segment(audio_path, chunk_path, start, end)
-                self.owned_temp_chunks.append(chunk_path)
+                export_jobs.append((chunk_path, start, end))
+
+            # 同一源文件的所有重编码片段在一个 FFmpeg 进程中完成，只完整解码
+            # 一次，避免第 N 片重复扫描前 N 段音频。
+            self.owned_temp_chunks = [job[0] for job in export_jobs]
+            self._export_audio_segments(audio_path, export_jobs, export_profile)
+            if self._is_cancelled:
+                raise RuntimeError("任务已取消。")
+
+            for index, (chunk_path, start, end) in enumerate(export_jobs):
                 self.temp_chunks.append(chunk_path)
                 self.chunk_offsets.append(round(start, 3))
                 self.log_message.emit(
@@ -289,10 +328,23 @@ class Worker(QObject):
             self.chunks_ready.emit(self.temp_chunks)
             return True
 
-        except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError) as e:
+        except (
+            subprocess.CalledProcessError,
+            FileNotFoundError,
+            PermissionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            OSError,
+        ) as e:
+            if self._is_cancelled:
+                self._cleanup_owned_chunk_artifacts()
+                self.log_message.emit("音频切分已取消。")
+                return False
             error_message = f"音频切分失败: {e}"
-            if hasattr(e, 'stderr'):
-                error_message += f"\nFFmpeg 输出:\n{e.stderr.strip()}"
+            stderr = getattr(e, 'stderr', None)
+            if stderr:
+                error_message += f"\nFFmpeg 输出:\n{stderr.strip()}"
             self._cleanup_owned_chunk_artifacts()
             self.error.emit(error_message)
             return False
@@ -307,15 +359,7 @@ class Worker(QObject):
         ]
 
         try:
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                startupinfo=self._startupinfo()
-            )
+            result = self._run_ffmpeg_command(command, check=False)
         except FileNotFoundError:
             return []
 
@@ -362,7 +406,10 @@ class Worker(QObject):
         while ideal_point < duration:
             if duration - ideal_point < min_segment_duration:
                 merged_tail_duration = duration - previous_point
-                if merged_tail_duration <= self.split_duration_sec + max_silence_overrun:
+                if (
+                    previous_point > 0 and
+                    merged_tail_duration <= self.split_duration_sec + max_silence_overrun
+                ):
                     break
 
             best_point = None
@@ -387,7 +434,10 @@ class Worker(QObject):
             split_point = round(split_point, 3)
             if duration - split_point < min_segment_duration:
                 merged_tail_duration = duration - previous_point
-                if merged_tail_duration <= self.split_duration_sec + max_silence_overrun:
+                if (
+                    previous_point > 0 and
+                    merged_tail_duration <= self.split_duration_sec + max_silence_overrun
+                ):
                     break
             if split_point <= previous_point + 0.001:
                 break
@@ -396,7 +446,55 @@ class Worker(QObject):
             previous_point = split_point
             ideal_point = split_point + self.split_duration_sec
 
-        return split_points
+        return self._rebalance_extremely_short_tail(
+            duration,
+            split_points,
+            silence_ranges,
+            min_segment_duration,
+            search_window,
+        )
+
+    def _rebalance_extremely_short_tail(
+            self,
+            duration: float,
+            split_points: List[float],
+            silence_ranges: List[Tuple[float, float]],
+            min_segment_duration: float,
+            search_window: float) -> List[float]:
+        """重新平衡最后两个片段，避免阈值附近产生数秒尾片。
+
+        普通的短尾（例如一分钟阈值下的 25 秒）仍保留；只有短于建议最小片长
+        一半的退化尾片才调整，因此不会无谓改变既有的常规切点。
+        """
+        if not split_points:
+            return split_points
+
+        tail_duration = duration - split_points[-1]
+        short_tail_limit = max(1.0, min_segment_duration * 0.5)
+        if tail_duration >= short_tail_limit:
+            return split_points
+
+        previous_point = split_points[-2] if len(split_points) > 1 else 0.0
+        balanced_point = previous_point + (duration - previous_point) / 2.0
+        best_point = balanced_point
+        best_distance = float("inf")
+
+        for silence_start, silence_end in silence_ranges:
+            midpoint = (silence_start + silence_end) / 2.0
+            left_duration = midpoint - previous_point
+            right_duration = duration - midpoint
+            if left_duration < short_tail_limit or right_duration < short_tail_limit:
+                continue
+            distance = abs(midpoint - balanced_point)
+            if distance <= search_window and distance < best_distance:
+                best_point = midpoint
+                best_distance = distance
+
+        rebalanced = list(split_points[:-1])
+        best_point = round(best_point, 3)
+        if best_point > previous_point + 0.001 and best_point < duration - 0.001:
+            rebalanced.append(best_point)
+        return rebalanced
 
     def _build_segment_ranges(self, duration: float,
                               split_points: List[float]) -> List[Tuple[float, float]]:
@@ -414,17 +512,19 @@ class Worker(QObject):
                 ranges.append((start, end))
         return ranges
 
-    def _chunk_extension_for_audio(self, audio_path: str) -> str:
+    def _chunk_extension_for_audio(self, audio_path: str,
+                                   media_info: Optional[Dict[str, Any]] = None) -> str:
+        if media_info:
+            return self._select_chunk_export_profile(audio_path, media_info).extension
         extension = os.path.splitext(audio_path)[1].lower()
         return extension or ".mka"
 
-    # 按源编码选择分片导出策略：
-    # - mp3: 帧无法在任意点流复制，实测切点会丢失约 0.1s 音频（后续整片时间轴偏移）
-    #   → 必须解码重编码，保证采样级精确切割、无缺口。
-    # - flac: 流复制内容完整，但 STREAMINFO 头沿用源文件总时长（分片元数据错误）
-    #   → 无损重编码，重建正确的容器元数据。
-    # - 其余 (aac/m4a/ogg/opus/wav/mka...): 流复制实测切点误差仅毫秒级且拼接无缺口，
-    #   保持无损快速复制，避免二次有损压缩与体积膨胀。
+    AAC_CONTAINER_NAMES = frozenset({
+        "mov", "mp4", "m4a", "3gp", "3g2", "mj2", "ipod"
+    })
+
+    # 兼容旧的扩展名入口。实际切片流程使用 _select_chunk_export_profile，
+    # 由 ffprobe 的 codec + container 决定策略并支持动态码率。
     REENCODE_CHUNK_CODEC_ARGS = {
         ".mp3": ["-c:a", "libmp3lame", "-b:a", "192k"],
         ".flac": ["-c:a", "flac"],
@@ -435,31 +535,270 @@ class Worker(QObject):
             chunk_extension.lower(), ["-c:a", "copy"]
         ))
 
+    @staticmethod
+    def _container_names(media_info: Dict[str, Any]) -> set:
+        format_name = media_info.get("container") or media_info.get("format") or ""
+        return {
+            name.strip().lower()
+            for name in str(format_name).split(",")
+            if name.strip()
+        }
+
+    def _select_chunk_export_profile(
+            self,
+            audio_path: str,
+            media_info: Dict[str, Any]) -> ChunkExportProfile:
+        """按真实音频编码和容器选择可精确切割的导出策略。"""
+        codec = str(media_info.get("codec") or "").strip().lower()
+        containers = self._container_names(media_info)
+        source_extension = os.path.splitext(audio_path)[1].lower()
+
+        if codec == "mp3":
+            return ChunkExportProfile(
+                extension=".flac",
+                codec_args=("-c:a", "flac"),
+                stream_copy=False,
+                description=(
+                    "MP3 无法在任意帧边界可靠复制切割；分片将精确解码并无损导出为 "
+                    "FLAC，避免漏音且不再增加有损压缩。"
+                ),
+            )
+
+        if codec == "flac":
+            return ChunkExportProfile(
+                extension=".flac",
+                codec_args=("-c:a", "flac"),
+                stream_copy=False,
+                description="FLAC 分片将无损重编码，以重建正确的分片时长元数据。",
+            )
+
+        if codec == "aac":
+            is_containerized_aac = bool(containers & self.AAC_CONTAINER_NAMES)
+            # 兼容旧探测结果没有 format/container 的情况；新的 ffprobe 结果始终
+            # 以真实容器为准，不会因伪造扩展名误选策略。
+            if not containers and source_extension in {".m4a", ".mp4", ".mov"}:
+                is_containerized_aac = True
+
+            if is_containerized_aac:
+                return ChunkExportProfile(
+                    extension=".flac",
+                    codec_args=("-c:a", "flac"),
+                    stream_copy=False,
+                    description=(
+                        "M4A/MP4 中的 AAC 分片将精确解码并无损导出为 FLAC；"
+                        "直接流复制会在独立解码时重新引入编码预延迟。"
+                    ),
+                    full_timeline_decode=True,
+                )
+
+            return ChunkExportProfile(
+                extension=".flac",
+                codec_args=("-c:a", "flac"),
+                stream_copy=False,
+                description=(
+                    "原始 AAC/ADTS 将完整解码后精确裁剪并无损导出为 FLAC，"
+                    "避免包边界漏音和二次有损压缩。"
+                ),
+                full_timeline_decode=True,
+            )
+
+        if codec == "opus":
+            return ChunkExportProfile(
+                extension=".flac",
+                codec_args=("-c:a", "flac"),
+                stream_copy=False,
+                description=(
+                    "Opus 分片将精确解码并无损导出为 FLAC，避免独立流的 "
+                    "pre-skip 边界损失和二次有损压缩。"
+                ),
+            )
+
+        if codec == "vorbis":
+            return ChunkExportProfile(
+                extension=".flac",
+                codec_args=("-c:a", "flac"),
+                stream_copy=False,
+                description=(
+                    "Vorbis 分片将精确解码并无损导出为 FLAC，避免 OGG 包边界漏音"
+                    "和二次有损压缩。"
+                ),
+            )
+
+        if codec == "pcm" or codec.startswith("pcm_"):
+            pcm_codec = codec if codec.startswith("pcm_") else "pcm_s16le"
+            wav_compatible_pcm = {
+                "pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le",
+                "pcm_f32le", "pcm_f64le", "pcm_alaw", "pcm_mulaw",
+            }
+            if pcm_codec not in wav_compatible_pcm:
+                return ChunkExportProfile(
+                    extension=".flac",
+                    codec_args=("-c:a", "flac"),
+                    stream_copy=False,
+                    description=(
+                        f"PCM 编码 {pcm_codec} 不适合直接写入 WAV；"
+                        "分片将无损导出为 FLAC。"
+                    ),
+                )
+            return ChunkExportProfile(
+                extension=".wav",
+                codec_args=("-c:a", pcm_codec),
+                stream_copy=False,
+                description=(
+                    f"PCM 分片将使用 {pcm_codec} 精确重建 WAV，保持未压缩样本质量。"
+                ),
+            )
+
+        # 未知或尚未验证可安全复制的编码使用 FLAC 保存解码后的波形，
+        # 以内容完整性优先，避免再次进行有损压缩。
+        return ChunkExportProfile(
+            extension=".flac",
+            codec_args=("-c:a", "flac"),
+            stream_copy=False,
+            description=(
+                f"编码 {codec or 'unknown'} 尚未验证可安全流复制，"
+                "分片将无损导出为 FLAC。"
+            ),
+        )
+
     def _export_audio_segment(self, audio_path: str, chunk_path: str,
-                              start: float, end: float):
+                              start: float, end: float,
+                              profile: Optional[ChunkExportProfile] = None):
         duration = max(0.001, end - start)
-        codec_args = self._chunk_codec_args(os.path.splitext(chunk_path)[1])
+        codec_args = (
+            list(profile.codec_args)
+            if profile is not None
+            else self._chunk_codec_args(os.path.splitext(chunk_path)[1])
+        )
+        stream_copy = (
+            profile.stream_copy
+            if profile is not None
+            else codec_args == ["-c:a", "copy"]
+        )
+
+        command = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
+        if stream_copy:
+            # 兼容旧的直接调用入口。生产切片配置不会对有损编码使用流复制。
+            command.extend([
+                "-i", audio_path,
+                "-ss", f"{start:.3f}",
+                "-t", f"{duration:.3f}",
+            ])
+        else:
+            full_timeline_decode = bool(profile and profile.full_timeline_decode)
+            seek_start = 0.0 if full_timeline_decode else max(0.0, start - 1.0)
+            if seek_start > 0:
+                command.extend(["-ss", f"{seek_start:.3f}"])
+            command.extend(["-i", audio_path])
+
+        command.extend([
+            "-map", "0:a:0",
+            "-vn",
+        ])
+        if not stream_copy:
+            trim_start = start if profile and profile.full_timeline_decode else start - seek_start
+            trim_end = end if profile and profile.full_timeline_decode else end - seek_start
+            command.extend([
+                "-af",
+                f"atrim=start={trim_start:.3f}:end={trim_end:.3f},asetpts=PTS-STARTPTS",
+            ])
+        command.extend([
+            *codec_args,
+            "-map_metadata", "-1",
+            "-avoid_negative_ts", "make_zero",
+            chunk_path,
+        ])
+
+        self._run_ffmpeg_command(command, check=True)
+
+    def _export_audio_segments(
+            self,
+            audio_path: str,
+            export_jobs: List[Tuple[str, float, float]],
+            profile: ChunkExportProfile):
+        """一次解码源音频并导出全部精确分片。"""
+        if not export_jobs:
+            return
+        if profile.stream_copy:
+            for chunk_path, start, end in export_jobs:
+                self._export_audio_segment(
+                    audio_path,
+                    chunk_path,
+                    start,
+                    end,
+                    profile=profile,
+                )
+            return
+
+        split_labels = "".join(f"[split{index}]" for index in range(len(export_jobs)))
+        filters = [f"[0:a:0]asplit={len(export_jobs)}{split_labels}"]
+        for index, (_, start, end) in enumerate(export_jobs):
+            filters.append(
+                f"[split{index}]atrim=start={start:.3f}:end={end:.3f},"
+                f"asetpts=PTS-STARTPTS[out{index}]"
+            )
+
         command = [
             "ffmpeg", "-hide_banner", "-nostdin", "-y",
             "-i", audio_path,
-            "-ss", f"{start:.3f}",
-            "-t", f"{duration:.3f}",
-            "-map", "0:a:0",
-            "-vn",
-            *codec_args,
-            "-avoid_negative_ts", "make_zero",
-            chunk_path
+            "-filter_complex", ";".join(filters),
         ]
+        for index, (chunk_path, _, _) in enumerate(export_jobs):
+            command.extend([
+                "-map", f"[out{index}]",
+                "-vn",
+                *profile.codec_args,
+                "-map_metadata", "-1",
+                "-avoid_negative_ts", "make_zero",
+                chunk_path,
+            ])
 
-        subprocess.run(
+        self._run_ffmpeg_command(command, check=True)
+
+    def _run_ffmpeg_command(self, command: List[str], check: bool = True):
+        """运行可被 request_cancellation() 终止的 FFmpeg 子进程。"""
+        process = subprocess.Popen(
             command,
-            check=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding='utf-8',
             errors='replace',
-            startupinfo=self._startupinfo()
+            startupinfo=self._startupinfo(),
         )
+        self._active_ffmpeg_process = process
+        termination_requested = False
+        try:
+            while True:
+                try:
+                    stdout, stderr = process.communicate(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self._is_cancelled and process.poll() is None:
+                        if termination_requested:
+                            process.kill()
+                        else:
+                            process.terminate()
+                            termination_requested = True
+
+            if self._is_cancelled:
+                raise RuntimeError("任务已取消。")
+            if check and process.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    process.returncode,
+                    command,
+                    output=stdout,
+                    stderr=stderr,
+                )
+            return subprocess.CompletedProcess(
+                command,
+                process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        finally:
+            if self._active_ffmpeg_process is process:
+                self._active_ffmpeg_process = None
 
     def _startupinfo(self):
         if sys.platform != "win32":
@@ -1021,6 +1360,13 @@ class Worker(QObject):
         self.log_message.emit("正在取消上传...")
         self._is_cancelled = True
 
+        active_ffmpeg = self._active_ffmpeg_process
+        if active_ffmpeg and active_ffmpeg.poll() is None:
+            try:
+                active_ffmpeg.terminate()
+            except OSError:
+                pass
+
         # 取消异步处理器
         if self.async_processor:
             self.async_processor.cancel()
@@ -1029,8 +1375,9 @@ class Worker(QObject):
         if self.uploader:
             self.uploader.cancel()
 
-        # 用户取消时强制清理临时文件
-        self._cleanup_chunks(force_cleanup=True)
+        # FFmpeg 正在写文件时由切分线程在进程退出后清理，避免删除竞态。
+        if not active_ffmpeg:
+            self._cleanup_chunks(force_cleanup=True)
 
     def _cleanup_chunks(self, force_cleanup=False):
         """清理所有临时的音频片段文件。

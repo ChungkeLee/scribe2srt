@@ -387,7 +387,7 @@ def test_worker_export_audio_segment_uses_stream_copy(monkeypatch):
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
 
-    monkeypatch.setattr("core.worker.subprocess.run", fake_run)
+    monkeypatch.setattr(worker, "_run_ffmpeg_command", fake_run)
 
     worker._export_audio_segment("source.ogg", "chunk_000.ogg", 1.25, 4.75)
 
@@ -425,7 +425,7 @@ def test_worker_export_audio_segment_reencodes_mp3(monkeypatch):
         split_duration_min=1,
     )
     calls = []
-    monkeypatch.setattr("core.worker.subprocess.run",
+    monkeypatch.setattr(worker, "_run_ffmpeg_command",
                         lambda command, **kwargs: calls.append(command))
 
     worker._export_audio_segment("source.mp3", "chunk_000.mp3", 1.0, 4.0)

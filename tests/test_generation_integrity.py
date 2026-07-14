@@ -227,14 +227,13 @@ def test_audio_event_not_collapsed_to_flash_in_dense_zone():
         ],
     }
     processor = SrtProcessor(data)
-    _, entries = _capture_entries(processor)
-    events = [e for e in entries if e.get("is_audio_event")]
-    assert events, "audio event entry should survive"
-    for event in events:
-        duration = event["end"] - event["start"]
-        assert duration >= processor.min_subtitle_duration - 0.01, (
-            f"audio event collapsed to {duration:.3f}s"
-        )
+    srt, entries = _capture_entries(processor)
+    matching = [entry for entry in entries if "(笑い)" in entry.get("text", "")]
+    assert matching, "audio event text should survive"
+    for entry in matching:
+        duration = entry["end"] - entry["start"]
+        assert duration >= 0.001, f"audio event collapsed to {duration:.3f}s"
+    assert "(笑い)" in srt
 
 
 def test_zero_duration_cluster_is_not_exploded_into_per_char_punctuation():

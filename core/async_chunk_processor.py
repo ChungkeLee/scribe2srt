@@ -7,6 +7,7 @@
 
 import os
 import json
+import math
 import re
 import time
 from typing import List, Dict, Any, Optional, Callable
@@ -19,48 +20,146 @@ def _normalized_word_text(text: str) -> str:
     return re.sub(r"\s+", "", (text or "")).strip().lower()
 
 
+def _is_spacing_word(word: Dict) -> bool:
+    return word.get("type") == "spacing"
+
+
+def _timed_boundary_words(words: List[Dict], window: int,
+                          from_end: bool) -> List[tuple]:
+    """返回边界窗口中的有效词及其原始索引，spacing 不占窗口。"""
+    timed_words = []
+    indices = range(len(words) - 1, -1, -1) if from_end else range(len(words))
+    for index in indices:
+        word = words[index]
+        if _is_spacing_word(word):
+            continue
+        if not _normalized_word_text(word.get("text")):
+            break
+
+        start, end = word.get("start"), word.get("end")
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            break
+        if not math.isfinite(start) or not math.isfinite(end):
+            break
+
+        timed_words.append((index, word))
+        if len(timed_words) >= window:
+            break
+
+    if from_end:
+        timed_words.reverse()
+    return timed_words
+
+
+def _speakers_are_compatible(existing_word: Dict, new_word: Dict) -> bool:
+    """说话人信息必须同为缺失或明确相同，才允许边界去重。"""
+    existing_speaker = existing_word.get("speaker_id")
+    new_speaker = new_word.get("speaker_id")
+    existing_missing = existing_speaker in (None, "")
+    new_missing = new_speaker in (None, "")
+    if existing_missing or new_missing:
+        return existing_missing and new_missing
+    return existing_speaker == new_speaker
+
+
+def _time_match_is_confident(existing_word: Dict, new_word: Dict,
+                             single_word_match: bool) -> bool:
+    """判断两个同文本词是否足够像同一次发音，而不是相邻的合法重复。"""
+    existing_start = float(existing_word["start"])
+    existing_end = float(existing_word["end"])
+    new_start = float(new_word["start"])
+    new_end = float(new_word["end"])
+
+    existing_duration = max(0.0, existing_end - existing_start)
+    new_duration = max(0.0, new_end - new_start)
+    endpoint_delta = max(
+        abs(existing_start - new_start),
+        abs(existing_end - new_end),
+    )
+
+    # 零时长词簇只有在时间戳几乎完全一致时才视为同一识别结果。
+    if existing_duration <= 0.001 or new_duration <= 0.001:
+        # 单个零时长重复无法区分“跨片重复”与真实连续重复，保留文字优先。
+        return not single_word_match and endpoint_delta <= 0.001
+
+    overlap = max(
+        0.0,
+        min(existing_end, new_end) - max(existing_start, new_start),
+    )
+    if overlap <= 0.001:
+        return False
+
+    overlap_ratio = overlap / min(existing_duration, new_duration)
+    if single_word_match:
+        # 单个常见词很容易真实连续出现。只有高度重叠，或两个短区间的
+        # 起止点都紧密对齐时才删除，轻微擦边重叠一律保留。
+        duration_ratio = min(existing_duration, new_duration) / max(
+            existing_duration, new_duration
+        )
+        return (
+            overlap_ratio >= 0.80 and
+            endpoint_delta <= 0.20 and
+            duration_ratio >= 0.50
+        ) or (
+            overlap_ratio >= 0.25 and endpoint_delta <= 0.075
+        )
+
+    # 两词及以上的连续文本序列已经提供了较强证据，但每一对词仍需存在
+    # 明确重叠且时间边界接近，避免误删紧邻重复说出的短语。
+    return overlap_ratio >= 0.10 and endpoint_delta <= 0.20
+
+
 def dedupe_boundary_words(existing_words: List[Dict], new_words: List[Dict],
                           window: int = 3) -> List[Dict]:
     """丢弃新分片开头与上一分片结尾在切割边界处重复的词。
 
     分片用 stream copy 在音频包边界切割会产生数十毫秒重叠；切点回退到固定点时还可能
-    切穿一个词，导致同一个词在相邻分片各转录一次。这里只在边界窗口内，按"文本相同且
-    时间区间重叠"判定重复并丢弃新片开头的重复词。真正连续重复说出的词（如"はい はい"）
-    时间区间不重叠，因此不会被误删。返回去重后的 new_words（可能原样返回）。
+    切穿一个词，导致相邻分片重复转录同一段内容。这里只比较上一片尾缀与新片前缀的最长
+    连续词序列；spacing 不参与匹配和窗口计数。说话人冲突、时间置信度不足或仅轻微重叠时
+    均保留原文。返回去重后的 new_words（可能原样返回）。
     """
-    if not existing_words or not new_words:
+    if not existing_words or not new_words or window <= 0:
         return new_words
 
-    tail = [
-        word for word in existing_words[-window:]
-        if isinstance(word.get("start"), (int, float)) and isinstance(word.get("end"), (int, float))
-    ]
-    if not tail:
+    tail = _timed_boundary_words(existing_words, window, from_end=True)
+    head = _timed_boundary_words(new_words, window, from_end=False)
+    if not tail or not head:
         return new_words
 
-    result = list(new_words)
-    removed = 0
-    while result and removed < window:
-        candidate = result[0]
-        start, end = candidate.get("start"), candidate.get("end")
-        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
-            break
-        candidate_text = _normalized_word_text(candidate.get("text"))
-        if not candidate_text:
-            break
+    max_match = min(len(tail), len(head), window)
+    for match_length in range(max_match, 0, -1):
+        existing_suffix = tail[-match_length:]
+        new_prefix = head[:match_length]
+        single_word_match = match_length == 1
 
-        is_duplicate = any(
-            _normalized_word_text(tail_word.get("text")) == candidate_text and
-            max(start, tail_word["start"]) < min(end, tail_word["end"]) - 0.001
-            for tail_word in tail
+        pairs_match = all(
+            _normalized_word_text(existing_word.get("text")) ==
+            _normalized_word_text(new_word.get("text"))
+            and _speakers_are_compatible(existing_word, new_word)
+            and _time_match_is_confident(
+                existing_word,
+                new_word,
+                single_word_match=single_word_match,
+            )
+            for (_, existing_word), (_, new_word)
+            in zip(existing_suffix, new_prefix)
         )
-        if not is_duplicate:
-            break
+        if not pairs_match:
+            continue
 
-        result.pop(0)
-        removed += 1
+        # 删除到最后一个重复词为止。它后面的 spacing 属于重复文本与下一词
+        # 之间的真实分隔，应保留，避免合并后出现 "wordnext"。
+        last_duplicate_index = new_prefix[-1][0]
+        result = list(new_words[last_duplicate_index + 1:])
+        if (
+            existing_words and result and
+            _is_spacing_word(existing_words[-1]) and
+            _is_spacing_word(result[0])
+        ):
+            result.pop(0)
+        return result
 
-    return result
+    return new_words
 
 
 class ChunkProcessorSignals(QObject):
@@ -450,6 +549,11 @@ class AsyncChunkProcessor(QObject):
                 if combined_transcript["text"]:
                     combined_transcript["text"] += " "
                 combined_transcript["text"] += text
+
+        if combined_transcript.get("words"):
+            combined_transcript["text"] = "".join(
+                word.get("text", "") for word in combined_transcript["words"]
+            )
 
         return combined_transcript
 
